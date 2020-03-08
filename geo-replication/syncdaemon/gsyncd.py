@@ -79,8 +79,6 @@ def main():
                    help="feedback fd between monitor and worker")
     p.add_argument("--local-node", help="Local master node")
     p.add_argument("--local-node-id", help="Local Node ID")
-    p.add_argument("--rpc-fd",
-                   help="Read and Write fds for worker-agent communication")
     p.add_argument("--subvol-num", type=int, help="Subvolume number")
     p.add_argument("--is-hottier", action="store_true",
                    help="Is this brick part of hot tier")
@@ -89,19 +87,6 @@ def main():
     p.add_argument("--resource-remote-id",
                    help="Remote node ID to connect to Slave Volume")
     p.add_argument("--slave-id", help="Slave Volume ID")
-    p.add_argument("-c", "--config-file", help="Config File")
-    p.add_argument("--debug", action="store_true")
-
-    # Agent
-    p = sp.add_parser("agent")
-    p.add_argument("master", help="Master Volume Name")
-    p.add_argument("slave", help="Slave details user@host::vol format")
-    p.add_argument("--local-path", help="Local brick path")
-    p.add_argument("--local-node", help="Local master node")
-    p.add_argument("--local-node-id", help="Local Node ID")
-    p.add_argument("--slave-id", help="Slave Volume ID")
-    p.add_argument("--rpc-fd",
-                   help="Read and Write fds for worker-agent communication")
     p.add_argument("-c", "--config-file", help="Config File")
     p.add_argument("--debug", action="store_true")
 
@@ -231,7 +216,8 @@ def main():
     # Set default path for config file in that case
     # If an subcmd accepts config file then it also accepts
     # master and Slave arguments.
-    if config_file is None and hasattr(args, "config_file"):
+    if config_file is None and hasattr(args, "config_file") \
+        and args.subcmd != "slave":
         config_file = "%s/geo-replication/%s_%s_%s/gsyncd.conf" % (
             GLUSTERD_WORKDIR,
             args.master,
@@ -255,7 +241,8 @@ def main():
     if args.subcmd == "slave":
         override_from_args = True
 
-    if args.subcmd == "monitor":
+    if config_file is not None and \
+       args.subcmd in ["monitor", "config-get", "config-set", "config-reset"]:
         ret = gconf.is_config_file_old(config_file, args.master, extra_tmpl_args["slavevol"])
         if ret is not None:
            gconf.config_upgrade(config_file, ret)
@@ -269,8 +256,8 @@ def main():
 
     # Default label to print in log file
     label = args.subcmd
-    if args.subcmd in ("worker", "agent"):
-        # If Worker or agent, then add brick path also to label
+    if args.subcmd in ("worker"):
+        # If Worker, then add brick path also to label
         label = "%s %s" % (args.subcmd, args.local_path)
     elif args.subcmd == "slave":
         # If Slave add Master node and Brick details
@@ -313,7 +300,7 @@ def main():
 
     # Log message for loaded config file
     if config_file is not None:
-        logging.info(lf("Using session config file", path=config_file))
+        logging.debug(lf("Using session config file", path=config_file))
 
     set_term_handler()
     excont = FreeObject(exval=0)

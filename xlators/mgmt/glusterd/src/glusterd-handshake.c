@@ -907,10 +907,20 @@ __server_getspec(rpcsvc_request_t *req)
     peer_info_t *peerinfo = NULL;
     xlator_t *this = NULL;
     dict_t *dict = NULL;
+    glusterd_peerinfo_t *peer = NULL;
+    glusterd_conf_t *conf = NULL;
+    int peer_cnt = 0;
+    char *peer_hosts = NULL;
+    char *tmp_str = NULL;
+    char portstr[10] = {
+        0,
+    };
+    int len = 0;
 
     this = THIS;
     GF_ASSERT(this);
 
+    conf = this->private;
     ret = xdr_to_generic(req->msg[0], &args, (xdrproc_t)xdr_gf_getspec_req);
     if (ret < 0) {
         // failed to decode msg;
@@ -998,6 +1008,43 @@ __server_getspec(rpcsvc_request_t *req)
                                  dict);
     }
 
+    RCU_READ_LOCK;
+    cds_list_for_each_entry_rcu(peer, &conf->peers, uuid_list)
+    {
+        if (!peer->connected)
+            continue;
+        if (!peer_hosts) {
+            if (peer->port) {
+                snprintf(portstr, sizeof(portstr), "%d", peer->port);
+            } else {
+                snprintf(portstr, sizeof(portstr), "%d", GLUSTERD_DEFAULT_PORT);
+            }
+            len = strlen(peer->hostname) + strlen(portstr) + 3;
+            tmp_str = GF_CALLOC(1, len, gf_gld_mt_char);
+            snprintf(tmp_str, len, "%s%s%s%s", peer->hostname, ":", portstr,
+                     " ");
+            peer_hosts = tmp_str;
+        } else {
+            len = strlen(peer_hosts) + strlen(peer->hostname) +
+                  strlen(portstr) + 3;
+            tmp_str = GF_CALLOC(1, len, gf_gld_mt_char);
+            snprintf(tmp_str, len, "%s%s%s%s%s", peer_hosts, peer->hostname,
+                     ":", portstr, " ");
+            GF_FREE(peer_hosts);
+            peer_hosts = tmp_str;
+        }
+        peer_cnt++;
+    }
+    RCU_READ_UNLOCK;
+    if (peer_cnt) {
+        ret = dict_set_str(dict, GLUSTERD_BRICK_SERVERS, peer_hosts);
+        if (ret) {
+            gf_msg(this->name, GF_LOG_ERROR, 0, GD_MSG_DICT_SET_FAILED,
+                   "failed to set peer_host in dict");
+            goto fail;
+        }
+    }
+
     if (ret == 0) {
         if (dict->count > 0) {
             ret = dict_allocate_and_serialize(dict, &rsp.xdata.xdata_val,
@@ -1005,11 +1052,9 @@ __server_getspec(rpcsvc_request_t *req)
             if (ret) {
                 gf_msg(this->name, GF_LOG_ERROR, 0,
                        GD_MSG_DICT_SERL_LENGTH_GET_FAIL,
-                       "Failed to serialize dict "
-                       "to request buffer");
+                       "Failed to serialize dict to request buffer");
                 goto fail;
             }
-            dict->extra_free = rsp.xdata.xdata_val;
         }
 
         /* to allocate the proper buffer to hold the file data */
@@ -1076,11 +1121,16 @@ fail:
     free(args.key);  // malloced by xdr
     free(rsp.spec);
 
+    if (peer_hosts)
+        GF_FREE(peer_hosts);
     if (dict)
         dict_unref(dict);
 
     if (args.xdata.xdata_val)
         free(args.xdata.xdata_val);
+
+    if (rsp.xdata.xdata_val)
+        GF_FREE(rsp.xdata.xdata_val);
 
     return 0;
 }
@@ -1708,16 +1758,16 @@ server_get_snap_info(rpcsvc_request_t *req)
     return glusterd_big_locked_handler(req, __server_get_snap_info);
 }
 
-rpcsvc_actor_t gluster_handshake_actors[GF_HNDSK_MAXVALUE] = {
-    [GF_HNDSK_NULL] = {"NULL", GF_HNDSK_NULL, NULL, NULL, 0, DRC_NA},
-    [GF_HNDSK_GETSPEC] = {"GETSPEC", GF_HNDSK_GETSPEC, server_getspec, NULL, 0,
-                          DRC_NA},
-    [GF_HNDSK_EVENT_NOTIFY] = {"EVENTNOTIFY", GF_HNDSK_EVENT_NOTIFY,
-                               server_event_notify, NULL, 0, DRC_NA},
-    [GF_HNDSK_GET_VOLUME_INFO] = {"GETVOLUMEINFO", GF_HNDSK_GET_VOLUME_INFO,
-                                  server_get_volume_info, NULL, 0, DRC_NA},
-    [GF_HNDSK_GET_SNAPSHOT_INFO] = {"GETSNAPINFO", GF_HNDSK_GET_SNAPSHOT_INFO,
-                                    server_get_snap_info, NULL, 0, DRC_NA},
+static rpcsvc_actor_t gluster_handshake_actors[GF_HNDSK_MAXVALUE] = {
+    [GF_HNDSK_NULL] = {"NULL", NULL, NULL, GF_HNDSK_NULL, DRC_NA, 0},
+    [GF_HNDSK_GETSPEC] = {"GETSPEC", server_getspec, NULL, GF_HNDSK_GETSPEC,
+                          DRC_NA, 0},
+    [GF_HNDSK_EVENT_NOTIFY] = {"EVENTNOTIFY", server_event_notify, NULL,
+                               GF_HNDSK_EVENT_NOTIFY, DRC_NA, 0},
+    [GF_HNDSK_GET_VOLUME_INFO] = {"GETVOLUMEINFO", server_get_volume_info, NULL,
+                                  GF_HNDSK_GET_VOLUME_INFO, DRC_NA, 0},
+    [GF_HNDSK_GET_SNAPSHOT_INFO] = {"GETSNAPINFO", server_get_snap_info, NULL,
+                                    GF_HNDSK_GET_SNAPSHOT_INFO, DRC_NA, 0},
 };
 
 struct rpcsvc_program gluster_handshake_prog = {
@@ -1729,9 +1779,9 @@ struct rpcsvc_program gluster_handshake_prog = {
 };
 
 /* A minimal RPC program just for the cli getspec command */
-rpcsvc_actor_t gluster_cli_getspec_actors[GF_HNDSK_MAXVALUE] = {
-    [GF_HNDSK_GETSPEC] = {"GETSPEC", GF_HNDSK_GETSPEC, server_getspec, NULL, 0,
-                          DRC_NA},
+static rpcsvc_actor_t gluster_cli_getspec_actors[GF_HNDSK_MAXVALUE] = {
+    [GF_HNDSK_GETSPEC] = {"GETSPEC", server_getspec, NULL, GF_HNDSK_GETSPEC,
+                          DRC_NA, 0},
 };
 
 struct rpcsvc_program gluster_cli_getspec_prog = {
@@ -1742,26 +1792,26 @@ struct rpcsvc_program gluster_cli_getspec_prog = {
     .numactors = GF_HNDSK_MAXVALUE,
 };
 
-char *glusterd_dump_proc[GF_DUMP_MAXVALUE] = {
+static char *glusterd_dump_proc[GF_DUMP_MAXVALUE] = {
     [GF_DUMP_NULL] = "NULL",
     [GF_DUMP_DUMP] = "DUMP",
     [GF_DUMP_PING] = "PING",
 };
 
-rpc_clnt_prog_t glusterd_dump_prog = {
+static rpc_clnt_prog_t glusterd_dump_prog = {
     .progname = "GLUSTERD-DUMP",
     .prognum = GLUSTER_DUMP_PROGRAM,
     .progver = GLUSTER_DUMP_VERSION,
     .procnames = glusterd_dump_proc,
 };
 
-rpcsvc_actor_t glusterd_mgmt_hndsk_actors[GD_MGMT_HNDSK_MAXVALUE] = {
-    [GD_MGMT_HNDSK_NULL] = {"NULL", GD_MGMT_HNDSK_NULL, NULL, NULL, 0, DRC_NA},
-    [GD_MGMT_HNDSK_VERSIONS] = {"MGMT-VERS", GD_MGMT_HNDSK_VERSIONS,
-                                glusterd_mgmt_hndsk_versions, NULL, 0, DRC_NA},
-    [GD_MGMT_HNDSK_VERSIONS_ACK] = {"MGMT-VERS-ACK", GD_MGMT_HNDSK_VERSIONS_ACK,
-                                    glusterd_mgmt_hndsk_versions_ack, NULL, 0,
-                                    DRC_NA},
+static rpcsvc_actor_t glusterd_mgmt_hndsk_actors[GD_MGMT_HNDSK_MAXVALUE] = {
+    [GD_MGMT_HNDSK_NULL] = {"NULL", NULL, NULL, GD_MGMT_HNDSK_NULL, DRC_NA, 0},
+    [GD_MGMT_HNDSK_VERSIONS] = {"MGMT-VERS", glusterd_mgmt_hndsk_versions, NULL,
+                                GD_MGMT_HNDSK_VERSIONS, DRC_NA, 0},
+    [GD_MGMT_HNDSK_VERSIONS_ACK] = {"MGMT-VERS-ACK",
+                                    glusterd_mgmt_hndsk_versions_ack, NULL,
+                                    GD_MGMT_HNDSK_VERSIONS_ACK, DRC_NA, 0},
 };
 
 struct rpcsvc_program glusterd_mgmt_hndsk_prog = {
@@ -1772,13 +1822,13 @@ struct rpcsvc_program glusterd_mgmt_hndsk_prog = {
     .numactors = GD_MGMT_HNDSK_MAXVALUE,
 };
 
-char *glusterd_mgmt_hndsk_proc[GD_MGMT_HNDSK_MAXVALUE] = {
+static char *glusterd_mgmt_hndsk_proc[GD_MGMT_HNDSK_MAXVALUE] = {
     [GD_MGMT_HNDSK_NULL] = "NULL",
     [GD_MGMT_HNDSK_VERSIONS] = "MGMT-VERS",
     [GD_MGMT_HNDSK_VERSIONS_ACK] = "MGMT-VERS-ACK",
 };
 
-rpc_clnt_prog_t gd_clnt_mgmt_hndsk_prog = {
+static rpc_clnt_prog_t gd_clnt_mgmt_hndsk_prog = {
     .progname = "Gluster MGMT Handshake",
     .prognum = GD_MGMT_HNDSK_PROGRAM,
     .progver = GD_MGMT_HNDSK_VERSION,

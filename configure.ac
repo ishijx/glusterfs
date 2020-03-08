@@ -305,6 +305,19 @@ else
         BUILD_TSAN=no
 fi
 
+# Initialize CFLAGS before usage
+BUILD_TCMALLOC=no
+AC_ARG_ENABLE([tcmalloc],
+              AC_HELP_STRING([--enable-tcmalloc],
+                             [Enable linking with tcmalloc library.]))
+if test "x$enable_tcmalloc" = "xyes"; then
+    BUILD_TCMALLOC=yes
+    GF_CFLAGS="${GF_CFLAGS} -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free"
+    AC_CHECK_LIB([tcmalloc], [malloc], [],
+                 [AC_MSG_ERROR([when --enable-tcmalloc is used, tcmalloc library needs to be present])])
+    GF_LDFLAGS="-ltcmalloc ${GF_LDFLAGS}"
+fi
+
 
 dnl When possible, prefer libtirpc over glibc rpc.
 dnl
@@ -1140,7 +1153,6 @@ if test "x$exec_prefix" = xNONE; then
         exec_prefix="$(eval echo $prefix)"
 fi
 GLUSTERFS_LIBEXECDIR="$(eval echo $libexecdir)/glusterfs"
-GLUSTERFSD_MISCDIR="$(eval echo $prefix)/var/lib/misc/glusterfsd"
 prefix=$old_prefix
 exec_prefix=$old_exec_prefix
 
@@ -1151,6 +1163,8 @@ if test "x$prefix" = xNONE; then
 fi
 localstatedir="$(eval echo ${localstatedir})"
 LOCALSTATEDIR=$localstatedir
+
+GLUSTERFSD_MISCDIR="$(eval echo ${localstatedir})/lib/misc/glusterfsd"
 
 old_prefix=$prefix
 if test "x$prefix" = xNONE; then
@@ -1316,6 +1330,7 @@ AC_ARG_ENABLE([gnfs],
                              [Enable legacy gnfs server xlator.]))
 if test "x${with_server}" = "xyes" -a "x$enable_gnfs" = "xyes"; then
     BUILD_GNFS="yes"
+    GF_CFLAGS="$GF_CFLAGS -DBUILD_GNFS"
     RPCBIND_SERVICE="rpcbind.service"
 fi
 AM_CONDITIONAL([BUILD_GNFS], [test x$BUILD_GNFS = xyes])
@@ -1583,6 +1598,7 @@ echo "IPV6 default         : $with_ipv6_default"
 echo "Use TIRPC            : $with_libtirpc"
 echo "With Python          : ${PYTHON_VERSION}"
 echo "Cloudsync            : $BUILD_CLOUDSYNC"
+echo "Link with TCMALLOC   : $BUILD_TCMALLOC"
 echo
 
 if test "x$BUILD_ASAN" = "xyes"; then

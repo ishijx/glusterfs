@@ -57,7 +57,6 @@ get_new_data()
 
     GF_ATOMIC_INIT(data->refcount, 0);
     data->is_static = _gf_false;
-    LOCK_INIT(&data->lock);
 
     return data;
 }
@@ -98,6 +97,7 @@ get_new_dict_full(int size_hint)
         }
     }
 
+    dict->free_pair.key = NULL;
     LOCK_INIT(&dict->lock);
 
     return dict;
@@ -293,8 +293,6 @@ void
 data_destroy(data_t *data)
 {
     if (data) {
-        LOCK_DESTROY(&data->lock);
-
         if (!data->is_static)
             GF_FREE(data->data);
 
@@ -325,7 +323,6 @@ data_copy(data_t *old)
     }
     newdata->data_type = old->data_type;
 
-    LOCK_INIT(&newdata->lock);
     return newdata;
 
 err_out:
@@ -339,7 +336,7 @@ err_out:
  * checked by callers.
  */
 static data_pair_t *
-dict_lookup_common(dict_t *this, char *key, uint32_t hash)
+dict_lookup_common(const dict_t *this, const char *key, const uint32_t hash)
 {
     int hashval = 0;
     data_pair_t *pair;
@@ -386,8 +383,8 @@ dict_lookup(dict_t *this, char *key, data_t **data)
 }
 
 static int32_t
-dict_set_lk(dict_t *this, char *key, data_t *value, const uint32_t hash,
-            gf_boolean_t replace)
+dict_set_lk(dict_t *this, char *key, const int key_len, data_t *value,
+            const uint32_t hash, gf_boolean_t replace)
 {
     int hashval = 0;
     data_pair_t *pair;
@@ -403,7 +400,7 @@ dict_set_lk(dict_t *this, char *key, data_t *value, const uint32_t hash,
         key_free = 1;
         key_hash = (uint32_t)XXH64(key, keylen, 0);
     } else {
-        keylen = strlen(key);
+        keylen = key_len;
         key_hash = hash;
     }
 
@@ -421,16 +418,15 @@ dict_set_lk(dict_t *this, char *key, data_t *value, const uint32_t hash,
         }
     }
 
-    if (this->free_pair_in_use) {
+    if (this->free_pair.key) { /* the free_pair is used */
         pair = mem_get(THIS->ctx->dict_pair_pool);
         if (!pair) {
             if (key_free)
                 GF_FREE(key);
             return -1;
         }
-    } else {
+    } else { /* assign the pair to the free pair */
         pair = &this->free_pair;
-        this->free_pair_in_use = _gf_true;
     }
 
     if (key_free) {
@@ -440,9 +436,7 @@ dict_set_lk(dict_t *this, char *key, data_t *value, const uint32_t hash,
     } else {
         pair->key = (char *)GF_MALLOC(keylen + 1, gf_common_mt_char);
         if (!pair->key) {
-            if (pair == &this->free_pair) {
-                this->free_pair_in_use = _gf_false;
-            } else {
+            if (pair != &this->free_pair) {
                 mem_put(pair);
             }
             return -1;
@@ -500,12 +494,12 @@ dict_setn(dict_t *this, char *key, const int keylen, data_t *value)
     }
 
     if (key) {
-        key_hash = (int32_t)XXH64(key, keylen, 0);
+        key_hash = (uint32_t)XXH64(key, keylen, 0);
     }
 
     LOCK(&this->lock);
 
-    ret = dict_set_lk(this, key, value, key_hash, 1);
+    ret = dict_set_lk(this, key, keylen, value, key_hash, 1);
 
     UNLOCK(&this->lock);
 
@@ -539,7 +533,7 @@ dict_addn(dict_t *this, char *key, const int keylen, data_t *value)
 
     LOCK(&this->lock);
 
-    ret = dict_set_lk(this, key, value, key_hash, 0);
+    ret = dict_set_lk(this, key, keylen, value, key_hash, 0);
 
     UNLOCK(&this->lock);
 
@@ -660,7 +654,7 @@ dict_deln(dict_t *this, char *key, const int keylen)
 
             GF_FREE(pair->key);
             if (pair == &this->free_pair) {
-                this->free_pair_in_use = _gf_false;
+                this->free_pair.key = NULL;
             } else {
                 mem_put(pair);
             }
@@ -700,6 +694,8 @@ dict_destroy(dict_t *this)
         GF_FREE(prev->key);
         if (prev != &this->free_pair) {
             mem_put(prev);
+        } else {
+            this->free_pair.key = NULL;
         }
         total_pairs++;
         prev = pair;
@@ -709,7 +705,6 @@ dict_destroy(dict_t *this)
         mem_put(this->members);
     }
 
-    GF_FREE(this->extra_free);
     free(this->extra_stdfree);
 
     /* update 'ctx->stats.dict.details' using max_count */
@@ -808,6 +803,7 @@ int_to_data(int64_t value)
     data->len = gf_asprintf(&data->data, "%" PRId64, value);
     if (-1 == data->len) {
         gf_msg_debug("dict", 0, "asprintf failed");
+        data_destroy(data);
         return NULL;
     }
     data->len++; /* account for terminating NULL */
@@ -827,6 +823,7 @@ data_from_int64(int64_t value)
     data->len = gf_asprintf(&data->data, "%" PRId64, value);
     if (-1 == data->len) {
         gf_msg_debug("dict", 0, "asprintf failed");
+        data_destroy(data);
         return NULL;
     }
     data->len++; /* account for terminating NULL */
@@ -846,6 +843,7 @@ data_from_int32(int32_t value)
     data->len = gf_asprintf(&data->data, "%" PRId32, value);
     if (-1 == data->len) {
         gf_msg_debug("dict", 0, "asprintf failed");
+        data_destroy(data);
         return NULL;
     }
 
@@ -866,6 +864,7 @@ data_from_int16(int16_t value)
     data->len = gf_asprintf(&data->data, "%" PRId16, value);
     if (-1 == data->len) {
         gf_msg_debug("dict", 0, "asprintf failed");
+        data_destroy(data);
         return NULL;
     }
 
@@ -886,6 +885,7 @@ data_from_int8(int8_t value)
     data->len = gf_asprintf(&data->data, "%d", value);
     if (-1 == data->len) {
         gf_msg_debug("dict", 0, "asprintf failed");
+        data_destroy(data);
         return NULL;
     }
 
@@ -906,6 +906,7 @@ data_from_uint64(uint64_t value)
     data->len = gf_asprintf(&data->data, "%" PRIu64, value);
     if (-1 == data->len) {
         gf_msg_debug("dict", 0, "asprintf failed");
+        data_destroy(data);
         return NULL;
     }
 
@@ -926,6 +927,8 @@ data_from_double(double value)
 
     data->len = gf_asprintf(&data->data, "%f", value);
     if (data->len == -1) {
+        gf_msg_debug("dict", 0, "asprintf failed");
+        data_destroy(data);
         return NULL;
     }
     data->len++; /* account for terminating NULL */
@@ -945,6 +948,7 @@ data_from_uint32(uint32_t value)
     data->len = gf_asprintf(&data->data, "%" PRIu32, value);
     if (-1 == data->len) {
         gf_msg_debug("dict", 0, "asprintf failed");
+        data_destroy(data);
         return NULL;
     }
 
@@ -964,6 +968,8 @@ data_from_uint16(uint16_t value)
     }
     data->len = gf_asprintf(&data->data, "%" PRIu16, value);
     if (-1 == data->len) {
+        gf_msg_debug("dict", 0, "asprintf failed");
+        data_destroy(data);
         return NULL;
     }
 
@@ -1243,8 +1249,8 @@ data_to_iatt(data_t *data, char *key)
      * pass more data but are backward compatible (if the initial contents
      * of the struct are maintained, of course). */
     if (data->len < sizeof(struct iatt)) {
-        gf_msg("glusterfs", GF_LOG_ERROR, ENOBUFS, LG_MSG_UNDERSIZED_BUF,
-               "data value for '%s' is smaller than expected", key);
+        gf_smsg("glusterfs", GF_LOG_ERROR, ENOBUFS, LG_MSG_UNDERSIZED_BUF,
+                "key=%s", key, NULL);
         return NULL;
     }
 
@@ -1261,8 +1267,8 @@ int
 dict_remove_foreach_fn(dict_t *d, char *k, data_t *v, void *_tmp)
 {
     if (!d || !k) {
-        gf_msg("glusterfs", GF_LOG_WARNING, EINVAL, LG_MSG_INVALID_ENTRY,
-               "%s is NULL", d ? "key" : "dictionary");
+        gf_smsg("glusterfs", GF_LOG_WARNING, EINVAL, LG_MSG_KEY_OR_VALUE_NULL,
+                "d=%s", d ? "key" : "dictionary", NULL);
         return -1;
     }
 
@@ -2083,7 +2089,7 @@ _dict_modify_flag(dict_t *this, char *key, int flag, int op)
      */
     GF_ASSERT(flag >= 0 && flag < DICT_MAX_FLAGS);
 
-    hash = (int32_t)XXH64(key, strlen(key), 0);
+    hash = (uint32_t)XXH64(key, strlen(key), 0);
     LOCK(&this->lock);
     {
         pair = dict_lookup_common(this, key, hash);
@@ -2097,8 +2103,8 @@ _dict_modify_flag(dict_t *this, char *key, int flag, int op)
         } else {
             ptr = GF_CALLOC(1, DICT_MAX_FLAGS / 8, gf_common_mt_char);
             if (!ptr) {
-                gf_msg("dict", GF_LOG_ERROR, ENOMEM, LG_MSG_NO_MEMORY,
-                       "unable to allocate flag bit array");
+                gf_smsg("dict", GF_LOG_ERROR, ENOMEM, LG_MSG_NO_MEMORY,
+                        "flag bit array", NULL);
                 ret = -ENOMEM;
                 goto err;
             }
@@ -2106,8 +2112,8 @@ _dict_modify_flag(dict_t *this, char *key, int flag, int op)
             data = data_from_dynptr(ptr, DICT_MAX_FLAGS / 8);
 
             if (!data) {
-                gf_msg("dict", GF_LOG_ERROR, ENOMEM, LG_MSG_NO_MEMORY,
-                       "unable to allocate data");
+                gf_smsg("dict", GF_LOG_ERROR, ENOMEM, LG_MSG_NO_MEMORY, "data",
+                        NULL);
                 GF_FREE(ptr);
                 ret = -ENOMEM;
                 goto err;
@@ -2118,23 +2124,22 @@ _dict_modify_flag(dict_t *this, char *key, int flag, int op)
             else
                 BIT_CLEAR((unsigned char *)(data->data), flag);
 
-            if (this->free_pair_in_use) {
+            if (this->free_pair.key) { /* the free pair is in use */
                 pair = mem_get0(THIS->ctx->dict_pair_pool);
                 if (!pair) {
-                    gf_msg("dict", GF_LOG_ERROR, ENOMEM, LG_MSG_NO_MEMORY,
-                           "unable to allocate dict pair");
+                    gf_smsg("dict", GF_LOG_ERROR, ENOMEM, LG_MSG_NO_MEMORY,
+                            "dict pair", NULL);
                     ret = -ENOMEM;
                     goto err;
                 }
-            } else {
+            } else { /* use the free pair */
                 pair = &this->free_pair;
-                this->free_pair_in_use = _gf_true;
             }
 
             pair->key = (char *)GF_MALLOC(strlen(key) + 1, gf_common_mt_char);
             if (!pair->key) {
-                gf_msg("dict", GF_LOG_ERROR, ENOMEM, LG_MSG_NO_MEMORY,
-                       "unable to allocate dict pair");
+                gf_smsg("dict", GF_LOG_ERROR, ENOMEM, LG_MSG_NO_MEMORY,
+                        "dict pair", NULL);
                 ret = -ENOMEM;
                 goto err;
             }
@@ -2166,12 +2171,11 @@ err:
         UNLOCK(&this->lock);
 
     if (pair) {
-        if (pair->key)
-            free(pair->key);
-
-        if (pair == &this->free_pair) {
-            this->free_pair_in_use = _gf_false;
-        } else {
+        if (pair->key) {
+            GF_FREE(pair->key);
+            pair->key = NULL;
+        }
+        if (pair != &this->free_pair) {
             mem_put(pair);
         }
     }
@@ -2179,8 +2183,8 @@ err:
     if (data)
         data_destroy(data);
 
-    gf_msg("dict", GF_LOG_ERROR, EINVAL, LG_MSG_DICT_SET_FAILED,
-           "unable to set key (%s) in dict ", key);
+    gf_smsg("dict", GF_LOG_ERROR, EINVAL, LG_MSG_DICT_SET_FAILED, "key=%s", key,
+            NULL);
 
     return ret;
 }
@@ -2703,8 +2707,8 @@ dict_get_mdata(dict_t *this, char *key, struct mdata_iatt *mdata)
 
     VALIDATE_DATA_AND_LOG(data, GF_DATA_TYPE_MDATA, key, -EINVAL);
     if (data->len < sizeof(struct mdata_iatt)) {
-        gf_msg("glusterfs", GF_LOG_ERROR, ENOBUFS, LG_MSG_UNDERSIZED_BUF,
-               "data value for '%s' is smaller than expected", key);
+        gf_smsg("glusterfs", GF_LOG_ERROR, ENOBUFS, LG_MSG_UNDERSIZED_BUF,
+                "key=%s", key, NULL);
         ret = -ENOBUFS;
         goto err;
     }
@@ -2791,7 +2795,7 @@ dict_get_str_boolean(dict_t *this, char *key, int default_val)
 
     VALIDATE_DATA_AND_LOG(data, GF_DATA_TYPE_INT, key, -EINVAL);
 
-    ret = gf_string2boolean(data->data, &boo);
+    ret = gf_strn2boolean(data->data, data->len - 1, &boo);
     if (ret == -1)
         goto err;
 
@@ -2811,6 +2815,7 @@ dict_rename_key(dict_t *this, char *key, char *replace_key)
     int ret = -EINVAL;
     uint32_t hash;
     uint32_t replacekey_hash;
+    int replacekey_len;
 
     /* replacing a key by itself is a NO-OP */
     if (strcmp(key, replace_key) == 0)
@@ -2823,7 +2828,8 @@ dict_rename_key(dict_t *this, char *key, char *replace_key)
     }
 
     hash = (uint32_t)XXH64(key, strlen(key), 0);
-    replacekey_hash = (uint32_t)XXH64(replace_key, strlen(replace_key), 0);
+    replacekey_len = strlen(replace_key);
+    replacekey_hash = (uint32_t)XXH64(replace_key, replacekey_len, 0);
 
     LOCK(&this->lock);
     {
@@ -2832,8 +2838,8 @@ dict_rename_key(dict_t *this, char *key, char *replace_key)
         if (!pair)
             ret = -ENODATA;
         else
-            ret = dict_set_lk(this, replace_key, pair->value, replacekey_hash,
-                              1);
+            ret = dict_set_lk(this, replace_key, replacekey_len, pair->value,
+                              replacekey_hash, 1);
     }
     UNLOCK(&this->lock);
 
@@ -2870,39 +2876,36 @@ dict_serialized_length_lk(dict_t *this)
     data_pair_t *pair = this->members_list;
 
     if (count < 0) {
-        gf_msg("dict", GF_LOG_ERROR, EINVAL, LG_MSG_COUNT_LESS_THAN_ZERO,
-               "count (%d) < 0!", count);
+        gf_smsg("dict", GF_LOG_ERROR, EINVAL, LG_MSG_COUNT_LESS_THAN_ZERO,
+                "count=%d", count, NULL);
         goto out;
     }
 
     while (count) {
         if (!pair) {
-            gf_msg("dict", GF_LOG_ERROR, EINVAL,
-                   LG_MSG_COUNT_LESS_THAN_DATA_PAIRS,
-                   "less than count data pairs found!");
+            gf_smsg("dict", GF_LOG_ERROR, EINVAL, LG_MSG_PAIRS_LESS_THAN_COUNT,
+                    NULL);
             goto out;
         }
 
         len += DICT_DATA_HDR_KEY_LEN + DICT_DATA_HDR_VAL_LEN;
 
         if (!pair->key) {
-            gf_msg("dict", GF_LOG_ERROR, EINVAL, LG_MSG_NULL_PTR,
-                   "pair->key is null!");
+            gf_smsg("dict", GF_LOG_ERROR, EINVAL, LG_MSG_NULL_PTR, NULL);
             goto out;
         }
 
         len += strlen(pair->key) + 1 /* for '\0' */;
 
         if (!pair->value) {
-            gf_msg("dict", GF_LOG_ERROR, EINVAL, LG_MSG_NULL_PTR,
-                   "pair->value is null!");
+            gf_smsg("dict", GF_LOG_ERROR, EINVAL, LG_MSG_NULL_PTR, NULL);
             goto out;
         }
 
         if (pair->value->len < 0) {
-            gf_msg("dict", GF_LOG_ERROR, EINVAL,
-                   LG_MSG_VALUE_LENGTH_LESS_THAN_ZERO, "value->len (%d) < 0",
-                   pair->value->len);
+            gf_smsg("dict", GF_LOG_ERROR, EINVAL,
+                    LG_MSG_VALUE_LENGTH_LESS_THAN_ZERO, "len=%d",
+                    pair->value->len, NULL);
             goto out;
         }
 
@@ -2939,14 +2942,13 @@ dict_serialize_lk(dict_t *this, char *buf)
     int32_t netword = 0;
 
     if (!buf) {
-        gf_msg("dict", GF_LOG_ERROR, EINVAL, LG_MSG_INVALID_ARG,
-               "buf is null!");
+        gf_smsg("dict", GF_LOG_ERROR, EINVAL, LG_MSG_INVALID_ARG, NULL);
         goto out;
     }
 
     if (count < 0) {
-        gf_msg("dict", GF_LOG_ERROR, 0, LG_MSG_COUNT_LESS_THAN_ZERO,
-               "count (%d) < 0!", count);
+        gf_smsg("dict", GF_LOG_ERROR, 0, LG_MSG_COUNT_LESS_THAN_ZERO,
+                "count=%d", count, NULL);
         goto out;
     }
 
@@ -2956,14 +2958,13 @@ dict_serialize_lk(dict_t *this, char *buf)
 
     while (count) {
         if (!pair) {
-            gf_msg("dict", GF_LOG_ERROR, 0, LG_MSG_PAIRS_LESS_THAN_COUNT,
-                   "less than count data pairs found!");
+            gf_smsg("dict", GF_LOG_ERROR, 0, LG_MSG_PAIRS_LESS_THAN_COUNT,
+                    NULL);
             goto out;
         }
 
         if (!pair->key) {
-            gf_msg("dict", GF_LOG_ERROR, 0, LG_MSG_NULL_PTR,
-                   "pair->key is null!");
+            gf_smsg("dict", GF_LOG_ERROR, 0, LG_MSG_NULL_PTR, NULL);
             goto out;
         }
 
@@ -2973,8 +2974,7 @@ dict_serialize_lk(dict_t *this, char *buf)
         buf += DICT_DATA_HDR_KEY_LEN;
 
         if (!pair->value) {
-            gf_msg("dict", GF_LOG_ERROR, 0, LG_MSG_NULL_PTR,
-                   "pair->value is null!");
+            gf_smsg("dict", GF_LOG_ERROR, 0, LG_MSG_NULL_PTR, NULL);
             goto out;
         }
 
@@ -3122,8 +3122,8 @@ dict_unserialize(char *orig_buf, int32_t size, dict_t **fill)
     buf += DICT_HDR_LEN;
 
     if (count < 0) {
-        gf_msg("dict", GF_LOG_ERROR, 0, LG_MSG_COUNT_LESS_THAN_ZERO,
-               "count (%d) <= 0", count);
+        gf_smsg("dict", GF_LOG_ERROR, 0, LG_MSG_COUNT_LESS_THAN_ZERO,
+                "count=%d", count, NULL);
         goto out;
     }
 
@@ -3279,32 +3279,30 @@ dict_serialize_value_with_delim_lk(dict_t *this, char *buf, int32_t *serz_len,
     data_pair_t *pair = this->members_list;
 
     if (!buf) {
-        gf_msg("dict", GF_LOG_ERROR, EINVAL, LG_MSG_INVALID_ARG, "buf is null");
+        gf_smsg("dict", GF_LOG_ERROR, EINVAL, LG_MSG_INVALID_ARG, NULL);
         goto out;
     }
 
     if (count < 0) {
-        gf_msg("dict", GF_LOG_ERROR, EINVAL, LG_MSG_INVALID_ARG,
-               "count (%d) < 0", count);
+        gf_smsg("dict", GF_LOG_ERROR, EINVAL, LG_MSG_INVALID_ARG, "count=%d",
+                count, NULL);
         goto out;
     }
 
     while (count) {
         if (!pair) {
-            gf_msg("dict", GF_LOG_ERROR, 0, LG_MSG_PAIRS_LESS_THAN_COUNT,
-                   "less than count data pairs found");
+            gf_smsg("dict", GF_LOG_ERROR, 0, LG_MSG_PAIRS_LESS_THAN_COUNT,
+                    NULL);
             goto out;
         }
 
         if (!pair->key || !pair->value) {
-            gf_msg("dict", GF_LOG_ERROR, 0, LG_MSG_KEY_OR_VALUE_NULL,
-                   "key or value is null");
+            gf_smsg("dict", GF_LOG_ERROR, 0, LG_MSG_KEY_OR_VALUE_NULL, NULL);
             goto out;
         }
 
         if (!pair->value->data) {
-            gf_msg("dict", GF_LOG_ERROR, 0, LG_MSG_NULL_VALUE_IN_DICT,
-                   "null value found in dict");
+            gf_smsg("dict", GF_LOG_ERROR, 0, LG_MSG_NULL_VALUE_IN_DICT, NULL);
             goto out;
         }
 
@@ -3396,12 +3394,11 @@ dict_dump_to_log(dict_t *dict)
 
     ret = dict_dump_to_str(dict, dump, dump_size, format);
     if (ret) {
-        gf_msg("dict", GF_LOG_WARNING, 0, LG_MSG_FAILED_TO_LOG_DICT,
-               "Failed to log dictionary");
+        gf_smsg("dict", GF_LOG_WARNING, 0, LG_MSG_FAILED_TO_LOG_DICT, NULL);
         goto out;
     }
-    gf_msg("dict", GF_LOG_INFO, 0, LG_MSG_DICT_ERROR, "dict=%p (%s)", dict,
-           dump);
+    gf_smsg("dict", GF_LOG_INFO, 0, LG_MSG_DICT_ERROR, "dict=%p", dict,
+            "dump=%s", dump, NULL);
 out:
     GF_FREE(dump);
 
@@ -3434,8 +3431,8 @@ dict_dump_to_statedump(dict_t *dict, char *dict_name, char *domain)
 
     ret = dict_dump_to_str(dict, dump, dump_size, format);
     if (ret) {
-        gf_msg(domain, GF_LOG_WARNING, 0, LG_MSG_FAILED_TO_LOG_DICT,
-               "Failed to log dictionary %s", dict_name);
+        gf_smsg(domain, GF_LOG_WARNING, 0, LG_MSG_FAILED_TO_LOG_DICT, "name=%s",
+                dict_name, NULL);
         goto out;
     }
     gf_proc_dump_build_key(key, domain, "%s", dict_name);

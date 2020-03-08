@@ -190,7 +190,11 @@ typedef struct changelog_ev_selector {
 
 /* changelog's private structure */
 struct changelog_priv {
+    /* changelog journalling */
     gf_boolean_t active;
+
+    /* changelog live notifications */
+    gf_boolean_t rpc_active;
 
     /* to generate unique socket file per brick */
     char *changelog_brick;
@@ -672,8 +676,8 @@ resolve_pargfid_to_path(xlator_t *this, const uuid_t gfid, char **path,
 #define CHANGELOG_NOT_ON_THEN_GOTO(priv, ret, label)                           \
     do {                                                                       \
         if (!priv->active) {                                                   \
-            gf_msg(this->name, GF_LOG_WARNING, 0, CHANGELOG_MSG_NOT_ACTIVE,    \
-                   "Changelog is not active, return success");                 \
+            gf_smsg(this->name, GF_LOG_WARNING, 0,                             \
+                    CHANGELOG_MSG_CHANGELOG_NOT_ACTIVE, NULL);                 \
             ret = 0;                                                           \
             goto label;                                                        \
         }                                                                      \

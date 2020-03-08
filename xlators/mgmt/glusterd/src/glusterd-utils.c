@@ -53,7 +53,6 @@
 #include "glusterd-svc-mgmt.h"
 #include "glusterd-svc-helper.h"
 #include "glusterd-shd-svc.h"
-#include "glusterd-nfs-svc.h"
 #include "glusterd-quotad-svc.h"
 #include "glusterd-snapd-svc.h"
 #include "glusterd-bitd-svc.h"
@@ -91,6 +90,7 @@
 #define NLMV4_VERSION 4
 #define NLMV1_VERSION 1
 
+#ifdef BUILD_GNFS
 #define GLUSTERD_GET_NFS_PIDFILE(pidfile, priv)                                \
     do {                                                                       \
         int32_t _nfs_pid_len;                                                  \
@@ -100,6 +100,7 @@
             pidfile[0] = 0;                                                    \
         }                                                                      \
     } while (0)
+#endif
 
 #define GLUSTERD_GET_QUOTAD_PIDFILE(pidfile, priv)                             \
     do {                                                                       \
@@ -4963,6 +4964,13 @@ glusterd_import_friend_volume(dict_t *peer_data, int count)
         goto out;
     }
 
+    ret = glusterd_create_volfiles(new_volinfo);
+    if (ret)
+        goto out;
+
+    glusterd_list_add_order(&new_volinfo->vol_list, &priv->volumes,
+                            glusterd_compare_volume_name);
+
     if (glusterd_is_volume_started(new_volinfo)) {
         (void)glusterd_start_bricks(new_volinfo);
         if (glusterd_is_snapd_enabled(new_volinfo)) {
@@ -4977,19 +4985,14 @@ glusterd_import_friend_volume(dict_t *peer_data, int count)
         }
     }
 
-    ret = glusterd_create_volfiles_and_notify_services(new_volinfo);
-    if (ret)
-        goto out;
-
     ret = glusterd_import_quota_conf(peer_data, count, new_volinfo, "volume");
     if (ret) {
         gf_event(EVENT_IMPORT_QUOTA_CONF_FAILED, "volume=%s",
                  new_volinfo->volname);
         goto out;
     }
-    glusterd_list_add_order(&new_volinfo->vol_list, &priv->volumes,
-                            glusterd_compare_volume_name);
 
+    ret = glusterd_fetchspec_notify(this);
 out:
     gf_msg_debug("glusterd", 0, "Returning with ret: %d", ret);
     return ret;
@@ -5470,10 +5473,12 @@ glusterd_add_node_to_dict(char *server, dict_t *dict, int count,
     glusterd_svc_build_pidfile_path(server, priv->rundir, pidfile,
                                     sizeof(pidfile));
 
-    if (strcmp(server, priv->nfs_svc.name) == 0)
-        svc = &(priv->nfs_svc);
-    else if (strcmp(server, priv->quotad_svc.name) == 0)
+    if (strcmp(server, priv->quotad_svc.name) == 0)
         svc = &(priv->quotad_svc);
+#ifdef BUILD_GNFS
+    else if (strcmp(server, priv->nfs_svc.name) == 0)
+        svc = &(priv->nfs_svc);
+#endif
     else if (strcmp(server, priv->bitd_svc.name) == 0)
         svc = &(priv->bitd_svc);
     else if (strcmp(server, priv->scrub_svc.name) == 0)
@@ -5498,12 +5503,14 @@ glusterd_add_node_to_dict(char *server, dict_t *dict, int count,
      */
 
     keylen = snprintf(key, sizeof(key), "brick%d.hostname", count);
-    if (!strcmp(server, priv->nfs_svc.name))
-        ret = dict_set_nstrn(dict, key, keylen, "NFS Server",
-                             SLEN("NFS Server"));
-    else if (!strcmp(server, priv->quotad_svc.name))
+    if (!strcmp(server, priv->quotad_svc.name))
         ret = dict_set_nstrn(dict, key, keylen, "Quota Daemon",
                              SLEN("Quota Daemon"));
+#ifdef BUILD_GNFS
+    else if (!strcmp(server, priv->nfs_svc.name))
+        ret = dict_set_nstrn(dict, key, keylen, "NFS Server",
+                             SLEN("NFS Server"));
+#endif
     else if (!strcmp(server, priv->bitd_svc.name))
         ret = dict_set_nstrn(dict, key, keylen, "Bitrot Daemon",
                              SLEN("Bitrot Daemon"));
@@ -5518,6 +5525,7 @@ glusterd_add_node_to_dict(char *server, dict_t *dict, int count,
     if (ret)
         goto out;
 
+#ifdef BUILD_GNFS
     /* Port is available only for the NFS server.
      * Self-heal daemon doesn't provide any port for access
      * by entities other than gluster.
@@ -5531,6 +5539,7 @@ glusterd_add_node_to_dict(char *server, dict_t *dict, int count,
         } else
             port = GF_NFS3_PORT;
     }
+#endif
     keylen = snprintf(key, sizeof(key), "brick%d.port", count);
     ret = dict_set_int32n(dict, key, keylen, port);
     if (ret)
@@ -5942,8 +5951,6 @@ attach_brick(xlator_t *this, glusterd_brickinfo_t *brickinfo,
              glusterd_volinfo_t *other_vol)
 {
     glusterd_conf_t *conf = this->private;
-    char pidfile1[PATH_MAX] = "";
-    char pidfile2[PATH_MAX] = "";
     char unslashed[PATH_MAX] = {
         '\0',
     };
@@ -5962,9 +5969,6 @@ attach_brick(xlator_t *this, glusterd_brickinfo_t *brickinfo,
            brickinfo->path, other_brick->path);
 
     GLUSTERD_REMOVE_SLASH_FROM_PATH(brickinfo->path, unslashed);
-
-    GLUSTERD_GET_BRICK_PIDFILE(pidfile1, other_vol, other_brick, conf);
-    GLUSTERD_GET_BRICK_PIDFILE(pidfile2, volinfo, brickinfo, conf);
 
     if (volinfo->is_snap_volume) {
         len = snprintf(full_id, sizeof(full_id), "/%s/%s/%s/%s.%s.%s",
@@ -8739,6 +8743,7 @@ glusterd_brick_terminate(glusterd_volinfo_t *volinfo,
                                  op_errstr, SIGTERM);
 }
 
+#ifdef BUILD_GNFS
 int
 glusterd_nfs_statedump(char *options, int option_cnt, char **op_errstr)
 {
@@ -8820,6 +8825,7 @@ out:
     GF_FREE(dup_options);
     return ret;
 }
+#endif
 
 int
 glusterd_client_statedump(char *volname, char *options, int option_cnt,
@@ -10121,7 +10127,7 @@ glusterd_volume_status_add_peer_rsp(dict_t *this, char *key, data_t *value,
     if (len < 0 || len >= sizeof(new_key))
         goto out;
 
-    ret = dict_set(rsp_ctx->dict, new_key, new_value);
+    ret = dict_setn(rsp_ctx->dict, new_key, len, new_value);
 out:
     if (ret) {
         data_unref(new_value);
@@ -12146,20 +12152,22 @@ glusterd_copy_uuid_to_dict(uuid_t uuid, dict_t *dict, char *key,
     return 0;
 }
 
-int
+static int
 _update_volume_op_versions(dict_t *this, char *key, data_t *value, void *data)
 {
     int op_version = 0;
     glusterd_volinfo_t *ctx = NULL;
     gf_boolean_t enabled = _gf_true;
     int ret = -1;
+    struct volopt_map_entry *vmep = NULL;
 
     GF_ASSERT(data);
     ctx = data;
 
-    op_version = glusterd_get_op_version_for_key(key);
+    vmep = gd_get_vmep(key);
+    op_version = glusterd_get_op_version_from_vmep(vmep);
 
-    if (gd_is_xlator_option(key) || gd_is_boolean_option(key)) {
+    if (gd_is_xlator_option(vmep) || gd_is_boolean_option(vmep)) {
         ret = gf_string2boolean(value->data, &enabled);
         if (ret)
             return 0;
@@ -12171,7 +12179,7 @@ _update_volume_op_versions(dict_t *this, char *key, data_t *value, void *data)
     if (op_version > ctx->op_version)
         ctx->op_version = op_version;
 
-    if (gd_is_client_option(key) && (op_version > ctx->client_op_version))
+    if (gd_is_client_option(vmep) && (op_version > ctx->client_op_version))
         ctx->client_op_version = op_version;
 
     return 0;
@@ -12665,6 +12673,11 @@ glusterd_enable_default_options(glusterd_volinfo_t *volinfo, char *option)
     int ret = 0;
     xlator_t *this = NULL;
     glusterd_conf_t *conf = NULL;
+#ifdef IPV6_DEFAULT
+    char *addr_family = "inet6";
+#else
+    char *addr_family = "inet";
+#endif
 
     this = THIS;
     GF_ASSERT(this);
@@ -12726,6 +12739,24 @@ glusterd_enable_default_options(glusterd_volinfo_t *volinfo, char *option)
             }
         }
     }
+
+    if (conf->op_version >= GD_OP_VERSION_3_9_0) {
+        if (!option || !strcmp("transport.address-family", option)) {
+            if (volinfo->transport_type == GF_TRANSPORT_TCP) {
+                ret = dict_set_dynstr_with_alloc(
+                    volinfo->dict, "transport.address-family", addr_family);
+                if (ret) {
+                    gf_msg(this->name, GF_LOG_ERROR, errno,
+                           GD_MSG_DICT_SET_FAILED,
+                           "failed to set transport."
+                           "address-family on %s",
+                           volinfo->volname);
+                    goto out;
+                }
+            }
+        }
+    }
+
     if (conf->op_version >= GD_OP_VERSION_7_0) {
         ret = dict_set_dynstr_with_alloc(volinfo->dict,
                                          "storage.fips-mode-rchecksum", "on");

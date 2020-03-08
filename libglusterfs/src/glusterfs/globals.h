@@ -116,6 +116,9 @@
 #define GD_OP_VERSION_6_0 60000 /* Op-version for GlusterFS 6.0 */
 
 #define GD_OP_VERSION_7_0 70000 /* Op-version for GlusterFS 7.0 */
+#define GD_OP_VERSION_7_1 70100 /* Op-version for GlusterFS 7.1 */
+#define GD_OP_VERSION_7_2 70200 /* Op-version for GlusterFS 7.2 */
+#define GD_OP_VERSION_7_3 70300 /* Op-version for GlusterFS 7.3 */
 
 #define GD_OP_VERSION_8_0 80000 /* Op-version for GlusterFS 8.0 */
 
@@ -163,6 +166,9 @@ glusterfs_leaseid_exist(void);
 /* init */
 int
 glusterfs_globals_init(glusterfs_ctx_t *ctx);
+
+void
+gf_thread_needs_cleanup(void);
 
 struct tvec_base *
 glusterfs_ctx_tw_get(glusterfs_ctx_t *ctx);

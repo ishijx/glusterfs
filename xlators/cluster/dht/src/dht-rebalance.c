@@ -1579,7 +1579,8 @@ dht_migrate_file(xlator_t *this, loc_t *loc, xlator_t *from, xlator_t *to,
     }
 
     /* If defrag is NULL, it should be assumed that migration is triggered
-     * from client */
+     * from client using the trusted.distribute.migrate-data virtual xattr
+     */
     defrag = conf->defrag;
 
     /* migration of files from clients is restricted to non-tiered clients
@@ -1633,6 +1634,10 @@ dht_migrate_file(xlator_t *this, loc_t *loc, xlator_t *from, xlator_t *to,
                " for file: %s",
                loc->path);
     }
+
+    /* The file is locked to prevent a rename during a migration. Renames
+     * and migrations on the file at the same time can lead to data loss.
+     */
 
     ret = dht_build_parent_loc(this, &parent_loc, loc, fop_errno);
     if (ret < 0) {
@@ -2447,15 +2452,12 @@ void
 dht_build_root_inode(xlator_t *this, inode_t **inode)
 {
     inode_table_t *itable = NULL;
-    uuid_t root_gfid = {
-        0,
-    };
+    static uuid_t root_gfid = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
 
     itable = inode_table_new(0, this);
     if (!itable)
         return;
 
-    root_gfid[15] = 1;
     *inode = inode_find(itable, root_gfid);
 }
 
@@ -3441,6 +3443,10 @@ gf_defrag_process_dir(xlator_t *this, gf_defrag_info_t *defrag, loc_t *loc,
                                       defrag, fd, migrate_data, dir_dfmeta,
                                       xattr_req, &should_commit_hash, perrno);
 
+            if (defrag->defrag_status == GF_DEFRAG_STATUS_STOPPED) {
+                goto out;
+            }
+
             if (ret) {
                 gf_log(this->name, GF_LOG_WARNING,
                        "Found "
@@ -3900,6 +3906,10 @@ gf_defrag_fix_layout(xlator_t *this, gf_defrag_info_t *defrag, loc_t *loc,
             ret = gf_defrag_fix_layout(this, defrag, &entry_loc, fix_layout,
                                        migrate_data);
 
+            if (defrag->defrag_status == GF_DEFRAG_STATUS_STOPPED) {
+                goto out;
+            }
+
             if (ret && ret != 2) {
                 gf_msg(this->name, GF_LOG_ERROR, 0, DHT_MSG_LAYOUT_FIX_FAILED,
                        "Fix layout failed for %s", entry_loc.path);
@@ -3922,6 +3932,13 @@ gf_defrag_fix_layout(xlator_t *this, gf_defrag_info_t *defrag, loc_t *loc,
         free_entries = _gf_false;
         INIT_LIST_HEAD(&entries.list);
     }
+
+    /* A directory layout is fixed only after its subdirs are healed to
+     * any newly added bricks. If the layout is fixed before subdirs are
+     * healed, the newly added brick will get a non-null layout.
+     * Any subdirs which hash to that layout will no longer show up
+     * in a directory listing until they are healed.
+     */
 
     ret = syncop_setxattr(this, loc, fix_layout, 0, NULL, NULL);
     if (ret) {

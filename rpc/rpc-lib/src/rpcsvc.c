@@ -41,7 +41,7 @@
 #include "xdr-rpcclnt.h"
 #include <glusterfs/glusterfs-acl.h>
 
-struct rpcsvc_program gluster_dump_prog;
+static struct rpcsvc_program gluster_dump_prog;
 
 #define rpcsvc_alloc_request(svc, request)                                     \
     do {                                                                       \
@@ -1855,6 +1855,18 @@ rpcsvc_program_unregister(rpcsvc_t *svc, rpcsvc_program_t *program)
         goto out;
     }
 
+    pthread_rwlock_rdlock(&svc->rpclock);
+    {
+        list_for_each_entry(prog, &svc->programs, program)
+        {
+            if ((prog->prognum == program->prognum) &&
+                (prog->progver == program->progver)) {
+                break;
+            }
+        }
+    }
+    pthread_rwlock_unlock(&svc->rpclock);
+
     ret = rpcsvc_program_unregister_portmap(program);
     if (ret == -1) {
         gf_log(GF_RPCSVC, GF_LOG_ERROR,
@@ -1871,17 +1883,6 @@ rpcsvc_program_unregister(rpcsvc_t *svc, rpcsvc_program_t *program)
         goto out;
     }
 #endif
-    pthread_rwlock_rdlock(&svc->rpclock);
-    {
-        list_for_each_entry(prog, &svc->programs, program)
-        {
-            if ((prog->prognum == program->prognum) &&
-                (prog->progver == program->progver)) {
-                break;
-            }
-        }
-    }
-    pthread_rwlock_unlock(&svc->rpclock);
 
     gf_log(GF_RPCSVC, GF_LOG_DEBUG,
            "Program unregistered: %s, Num: %d,"
@@ -1902,6 +1903,9 @@ rpcsvc_program_unregister(rpcsvc_t *svc, rpcsvc_program_t *program)
 
     ret = 0;
 out:
+    if (prog)
+        GF_FREE(prog);
+
     if (ret == -1) {
         if (program) {
             gf_log(GF_RPCSVC, GF_LOG_ERROR,
@@ -3196,10 +3200,6 @@ rpcsvc_match_subnet_v4(const char *addrtok, const char *ipaddr)
     if (inet_pton(AF_INET, ipaddr, &sin1.sin_addr) == 0)
         goto out;
 
-    /* Find the network socket addr of subnet pattern */
-    if (inet_pton(AF_INET, netaddr, &sin2.sin_addr) == 0)
-        goto out;
-
     slash = strchr(netaddr, '/');
     if (slash) {
         *slash = '\0';
@@ -3212,8 +3212,15 @@ rpcsvc_match_subnet_v4(const char *addrtok, const char *ipaddr)
         if (prefixlen > 31)
             goto out;
     } else {
+        /* if there is no '/', then this function wouldn't be called */
         goto out;
     }
+
+    /* Need to do this after removing '/', as inet_pton() take IP address as
+     * second argument. Once we get sin2, then comparison is oranges to orange
+     */
+    if (inet_pton(AF_INET, netaddr, &sin2.sin_addr) == 0)
+        goto out;
 
     shift = IPv4_ADDR_SIZE - prefixlen;
     mask.sin_addr.s_addr = htonl((uint32_t)~0 << shift);
@@ -3227,13 +3234,13 @@ out:
     return ret;
 }
 
-rpcsvc_actor_t gluster_dump_actors[GF_DUMP_MAXVALUE] = {
-    [GF_DUMP_NULL] = {"NULL", GF_DUMP_NULL, NULL, NULL, 0, DRC_NA},
-    [GF_DUMP_DUMP] = {"DUMP", GF_DUMP_DUMP, rpcsvc_dump, NULL, 0, DRC_NA},
-    [GF_DUMP_PING] = {"PING", GF_DUMP_PING, rpcsvc_ping, NULL, 0, DRC_NA},
+static rpcsvc_actor_t gluster_dump_actors[GF_DUMP_MAXVALUE] = {
+    [GF_DUMP_NULL] = {"NULL", NULL, NULL, GF_DUMP_NULL, DRC_NA, 0},
+    [GF_DUMP_DUMP] = {"DUMP", rpcsvc_dump, NULL, GF_DUMP_DUMP, DRC_NA, 0},
+    [GF_DUMP_PING] = {"PING", rpcsvc_ping, NULL, GF_DUMP_PING, DRC_NA, 0},
 };
 
-struct rpcsvc_program gluster_dump_prog = {
+static struct rpcsvc_program gluster_dump_prog = {
     .progname = "GF-DUMP",
     .prognum = GLUSTER_DUMP_PROGRAM,
     .progver = GLUSTER_DUMP_VERSION,

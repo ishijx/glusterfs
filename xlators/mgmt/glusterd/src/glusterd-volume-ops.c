@@ -1185,6 +1185,36 @@ glusterd_op_stage_create_volume(dict_t *dict, char **op_errstr,
         }
     }
 
+    /*Check brick order if the volume type is replicate or disperse. If
+     * force at the end of command not given then check brick order.
+     */
+    if (is_origin_glusterd(dict)) {
+        ret = dict_get_int32n(dict, "type", SLEN("type"), &type);
+        if (ret) {
+            snprintf(msg, sizeof(msg),
+                     "Unable to get type of "
+                     "volume %s",
+                     volname);
+            gf_msg(this->name, GF_LOG_WARNING, 0, GD_MSG_DICT_GET_FAILED, "%s",
+                   msg);
+            goto out;
+        }
+
+        if (!is_force) {
+            if ((type == GF_CLUSTER_TYPE_REPLICATE) ||
+                (type == GF_CLUSTER_TYPE_DISPERSE)) {
+                ret = glusterd_check_brick_order(dict, msg);
+                if (ret) {
+                    gf_msg(this->name, GF_LOG_ERROR, 0, GD_MSG_BAD_BRKORDER,
+                           "Not "
+                           "creating volume because of "
+                           "bad brick order");
+                    goto out;
+                }
+            }
+        }
+    }
+
     while (i < brick_count) {
         i++;
         brick = strtok_r(brick_list, " \n", &tmpptr);
@@ -1262,36 +1292,6 @@ glusterd_op_stage_create_volume(dict_t *dict, char **op_errstr,
         }
         glusterd_brickinfo_delete(brick_info);
         brick_info = NULL;
-    }
-
-    /*Check brick order if the volume type is replicate or disperse. If
-     * force at the end of command not given then check brick order.
-     */
-    if (is_origin_glusterd(dict)) {
-        ret = dict_get_int32n(dict, "type", SLEN("type"), &type);
-        if (ret) {
-            snprintf(msg, sizeof(msg),
-                     "Unable to get type of "
-                     "volume %s",
-                     volname);
-            gf_msg(this->name, GF_LOG_WARNING, 0, GD_MSG_DICT_GET_FAILED, "%s",
-                   msg);
-            goto out;
-        }
-
-        if (!is_force) {
-            if ((type == GF_CLUSTER_TYPE_REPLICATE) ||
-                (type == GF_CLUSTER_TYPE_DISPERSE)) {
-                ret = glusterd_check_brick_order(dict, msg);
-                if (ret) {
-                    gf_msg(this->name, GF_LOG_ERROR, 0, GD_MSG_BAD_BRKORDER,
-                           "Not "
-                           "creating volume because of "
-                           "bad brick order");
-                    goto out;
-                }
-            }
-        }
     }
 
     ret = dict_set_int32n(rsp_dict, "brick_count", SLEN("brick_count"),
@@ -1803,7 +1803,9 @@ glusterd_handle_heal_cmd(xlator_t *this, glusterd_volinfo_t *volinfo,
             if (!glusterd_is_volume_replicate(volinfo)) {
                 ret = -1;
                 snprintf(msg, sizeof(msg),
-                         "Volume %s is not of type "
+                         "This command is supported "
+                         "for only volume of replicated "
+                         "type. Volume %s is not of type "
                          "replicate",
                          volinfo->volname);
                 *op_errstr = gf_strdup(msg);
@@ -2085,7 +2087,7 @@ glusterd_op_create_volume(dict_t *dict, char **op_errstr)
         0,
     };
     char *brick_mount_dir = NULL;
-    char key[PATH_MAX] = "";
+    char key[64] = "";
     char *address_family_str = NULL;
     struct statvfs brickstat = {
         0,
@@ -2786,16 +2788,16 @@ glusterd_op_statedump_volume(dict_t *dict, char **op_errstr)
     if (ret)
         goto out;
     gf_msg_debug("glusterd", 0, "Performing statedump on volume %s", volname);
-    if (strstr(options, "nfs") != NULL) {
-        ret = glusterd_nfs_statedump(options, option_cnt, op_errstr);
-        if (ret)
-            goto out;
-
-    } else if (strstr(options, "quotad")) {
+    if (strstr(options, "quotad")) {
         ret = glusterd_quotad_statedump(options, option_cnt, op_errstr);
         if (ret)
             goto out;
-
+#ifdef BUILD_GNFS
+    } else if (strstr(options, "nfs") != NULL) {
+        ret = glusterd_nfs_statedump(options, option_cnt, op_errstr);
+        if (ret)
+            goto out;
+#endif
     } else if (strstr(options, "client")) {
         ret = glusterd_client_statedump(volname, options, option_cnt,
                                         op_errstr);

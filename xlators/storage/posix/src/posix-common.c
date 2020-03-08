@@ -26,7 +26,6 @@
 #include <signal.h>
 #include <sys/uio.h>
 #include <unistd.h>
-#include <ftw.h>
 
 #ifndef GF_BSD_HOST_OS
 #include <alloca.h>
@@ -144,7 +143,7 @@ posix_notify(xlator_t *this, int32_t event, void *data, ...)
 
     switch (event) {
         case GF_EVENT_PARENT_UP: {
-            /* the parent that posix xlator is up */
+            /* Notify the parent that posix xlator is up */
             default_notify(this, GF_EVENT_CHILD_UP, data);
         } break;
 
@@ -570,7 +569,7 @@ posix_init(xlator_t *this)
     uuid_t gfid = {
         0,
     };
-    uuid_t rootgfid = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    static uuid_t rootgfid = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
     char *guuid = NULL;
     int32_t uid = -1;
     int32_t gid = -1;
@@ -1246,7 +1245,7 @@ struct volume_options posix_options[] = {
     {.key = {"health-check-timeout"},
      .type = GF_OPTION_TYPE_INT,
      .min = 0,
-     .default_value = "10",
+     .default_value = "20",
      .validate = GF_OPT_VALIDATE_MIN,
      .description =
          "Interval in seconds to wait aio_write finish for health check, "

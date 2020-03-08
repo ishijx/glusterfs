@@ -80,7 +80,8 @@ __shard_inode_ctx_get(inode_t *inode, xlator_t *this, shard_inode_ctx_t **ctx)
     INIT_LIST_HEAD(&ctx_p->ilist);
     INIT_LIST_HEAD(&ctx_p->to_fsync_list);
 
-    ret = __inode_ctx_set(inode, this, (uint64_t *)&ctx_p);
+    ctx_uint = (uint64_t)(uintptr_t)ctx_p;
+    ret = __inode_ctx_set(inode, this, &ctx_uint);
     if (ret < 0) {
         GF_FREE(ctx_p);
         return ret;
@@ -1607,7 +1608,8 @@ shard_lookup(call_frame_t *frame, xlator_t *this, loc_t *loc, dict_t *xattr_req)
     shard_local_t *local = NULL;
 
     this->itable = loc->inode->table;
-    if (frame->root->pid != GF_CLIENT_PID_GSYNCD) {
+    if ((frame->root->pid != GF_CLIENT_PID_GSYNCD) &&
+        (frame->root->pid != GF_CLIENT_PID_GLFS_HEAL)) {
         SHARD_ENTRY_FOP_CHECK(loc, op_errno, err);
     }
 
@@ -4035,6 +4037,7 @@ shard_unlink_base_file_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
         local->op_ret = op_ret;
         local->op_errno = op_errno;
     } else {
+        shard_inode_ctx_set_refresh_flag(local->int_inodelk.loc.inode, this);
         local->preoldparent = *preparent;
         local->postoldparent = *postparent;
         if (xdata)

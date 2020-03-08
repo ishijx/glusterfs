@@ -123,6 +123,7 @@ trap(void);
 
 /* Default value of signing waiting time to sign a file for bitrot */
 #define SIGNING_TIMEOUT "120"
+#define BR_WORKERS "4"
 
 /* xxhash */
 #define GF_XXH64_DIGEST_LENGTH 8
@@ -423,9 +424,6 @@ BIT_VALUE(unsigned char *array, unsigned int index)
             goto label;                                                        \
         }                                                                      \
     } while (0)
-
-#define GF_FILE_CONTENT_REQUESTED(_xattr_req, _content_limit)                  \
-    (dict_get_uint64(_xattr_req, "glusterfs.content", _content_limit) == 0)
 
 #ifdef DEBUG
 #define GF_ASSERT(x) assert(x);
@@ -906,6 +904,8 @@ gf_string2percent_or_bytesize(const char *str, double *n,
 
 int
 gf_string2boolean(const char *str, gf_boolean_t *b);
+int
+gf_strn2boolean(const char *str, const int len, gf_boolean_t *b);
 int
 gf_string2percent(const char *str, double *n);
 int

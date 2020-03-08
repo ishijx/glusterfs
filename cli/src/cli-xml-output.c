@@ -2507,8 +2507,9 @@ cli_xml_output_vol_info(cli_local_t *local, dict_t *dict)
         ret = dict_get_int32(dict, key, &dist_count);
         if (ret)
             goto out;
-        ret = xmlTextWriterWriteFormatElement(
-            local->writer, (xmlChar *)"distCount", "%d", dist_count);
+        ret = xmlTextWriterWriteFormatElement(local->writer,
+                                              (xmlChar *)"distCount", "%d",
+                                              (brick_count / dist_count));
         XML_RET_CHECK_AND_GOTO(ret, out);
 
         snprintf(key, sizeof(key), "volume%d.stripe_count", i);
@@ -3579,20 +3580,21 @@ cli_xml_output_vol_gsync_status(dict_t *dict, xmlTextWriterPtr writer)
     char *volume_next = NULL;
     char *slave = NULL;
     char *slave_next = NULL;
-    char *title_values[] = {"master_node", "", "master_brick", "slave_user",
-                            "slave", "slave_node", "status", "crawl_status",
-                            /* last_synced */
-                            "", "entry", "data", "meta", "failures",
-                            /* checkpoint_time */
-                            "", "checkpoint_completed",
-                            /* checkpoint_completion_time */
-                            "", "master_node_uuid",
-                            /* last_synced_utc */
-                            "last_synced",
-                            /* checkpoint_time_utc */
-                            "checkpoint_time",
-                            /* checkpoint_completion_time_utc */
-                            "checkpoint_completion_time"};
+    static const char *title_values[] = {
+        "master_node", "", "master_brick", "slave_user", "slave", "slave_node",
+        "status", "crawl_status",
+        /* last_synced */
+        "", "entry", "data", "meta", "failures",
+        /* checkpoint_time */
+        "", "checkpoint_completed",
+        /* checkpoint_completion_time */
+        "", "master_node_uuid",
+        /* last_synced_utc */
+        "last_synced",
+        /* checkpoint_time_utc */
+        "checkpoint_time",
+        /* checkpoint_completion_time_utc */
+        "checkpoint_completion_time"};
 
     GF_ASSERT(dict);
 

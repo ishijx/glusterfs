@@ -26,11 +26,11 @@ mgmt_cbk_snap(struct rpc_clnt *rpc, void *mydata, void *data)
     return 0;
 }
 
-rpcclnt_cb_actor_t svs_cbk_actors[GF_CBK_MAXVALUE] = {
-    [GF_CBK_GET_SNAPS] = {"GETSNAPS", GF_CBK_GET_SNAPS, mgmt_cbk_snap},
+static rpcclnt_cb_actor_t svs_cbk_actors[GF_CBK_MAXVALUE] = {
+    [GF_CBK_GET_SNAPS] = {"GETSNAPS", mgmt_cbk_snap, GF_CBK_GET_SNAPS},
 };
 
-struct rpcclnt_cb_program svs_cbk_prog = {
+static struct rpcclnt_cb_program svs_cbk_prog = {
     .progname = "GlusterFS Callback",
     .prognum = GLUSTER_CBK_PROGRAM,
     .progver = GLUSTER_CBK_VERSION,
@@ -38,12 +38,12 @@ struct rpcclnt_cb_program svs_cbk_prog = {
     .numactors = GF_CBK_MAXVALUE,
 };
 
-char *clnt_handshake_procs[GF_HNDSK_MAXVALUE] = {
+static char *clnt_handshake_procs[GF_HNDSK_MAXVALUE] = {
     [GF_HNDSK_NULL] = "NULL",
     [GF_HNDSK_EVENT_NOTIFY] = "EVENTNOTIFY",
 };
 
-rpc_clnt_prog_t svs_clnt_handshake_prog = {
+static rpc_clnt_prog_t svs_clnt_handshake_prog = {
     .progname = "GlusterFS Handshake",
     .prognum = GLUSTER_HNDSK_PROGRAM,
     .progver = GLUSTER_HNDSK_VERSION,
@@ -237,7 +237,8 @@ mgmt_get_snapinfo_cbk(struct rpc_req *req, struct iovec *iov, int count,
     glusterfs_ctx_t *ctx = NULL;
     int ret = -1;
     dict_t *dict = NULL;
-    char key[1024] = {0};
+    char key[32] = {0};
+    int len;
     int snapcount = 0;
     svs_private_t *priv = NULL;
     xlator_t *this = NULL;
@@ -330,8 +331,8 @@ mgmt_get_snapinfo_cbk(struct rpc_req *req, struct iovec *iov, int count,
     }
 
     for (i = 0; i < snapcount; i++) {
-        snprintf(key, sizeof(key), "snap-volname.%d", i + 1);
-        ret = dict_get_str(dict, key, &value);
+        len = snprintf(key, sizeof(key), "snap-volname.%d", i + 1);
+        ret = dict_get_strn(dict, key, len, &value);
         if (ret) {
             errno = EINVAL;
             ret = -1;
@@ -343,8 +344,8 @@ mgmt_get_snapinfo_cbk(struct rpc_req *req, struct iovec *iov, int count,
         strncpy(dirents[i].snap_volname, value,
                 sizeof(dirents[i].snap_volname));
 
-        snprintf(key, sizeof(key), "snap-id.%d", i + 1);
-        ret = dict_get_str(dict, key, &value);
+        len = snprintf(key, sizeof(key), "snap-id.%d", i + 1);
+        ret = dict_get_strn(dict, key, len, &value);
         if (ret) {
             errno = EINVAL;
             ret = -1;
@@ -354,8 +355,8 @@ mgmt_get_snapinfo_cbk(struct rpc_req *req, struct iovec *iov, int count,
         }
         strncpy(dirents[i].uuid, value, sizeof(dirents[i].uuid));
 
-        snprintf(key, sizeof(key), "snapname.%d", i + 1);
-        ret = dict_get_str(dict, key, &value);
+        len = snprintf(key, sizeof(key), "snapname.%d", i + 1);
+        ret = dict_get_strn(dict, key, len, &value);
         if (ret) {
             errno = EINVAL;
             ret = -1;

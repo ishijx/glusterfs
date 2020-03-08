@@ -86,6 +86,7 @@ afr_selfheal_recreate_entry(call_frame_t *frame, int dst, int source,
         0,
     };
     unsigned char *newentry = NULL;
+    char dir_uuid_str[64] = {0}, iatt_uuid_str[64] = {0};
 
     priv = this->private;
     iatt = &replies[source].poststat;
@@ -93,8 +94,8 @@ afr_selfheal_recreate_entry(call_frame_t *frame, int dst, int source,
         gf_msg(this->name, GF_LOG_ERROR, 0, AFR_MSG_SELF_HEAL_FAILED,
                "Invalid ia_type (%d) or gfid(%s). source brick=%d, "
                "pargfid=%s, name=%s",
-               iatt->ia_type, uuid_utoa(iatt->ia_gfid), source,
-               uuid_utoa(dir->gfid), name);
+               iatt->ia_type, uuid_utoa_r(iatt->ia_gfid, iatt_uuid_str), source,
+               uuid_utoa_r(dir->gfid, dir_uuid_str), name);
         ret = -EINVAL;
         goto out;
     }
@@ -479,6 +480,7 @@ __afr_selfheal_entry_finalize_source(xlator_t *this, unsigned char *sources,
     afr_private_t *priv = NULL;
     int source = -1;
     int sources_count = 0;
+    int i = 0;
 
     priv = this->private;
 
@@ -492,6 +494,20 @@ __afr_selfheal_entry_finalize_source(xlator_t *this, unsigned char *sources,
     }
 
     source = afr_choose_source_by_policy(priv, sources, AFR_ENTRY_TRANSACTION);
+
+    /*If the selected source does not blame any other brick, then mark
+     * everything as sink to trigger conservative merge.
+     */
+    if (source != -1 && !AFR_COUNT(healed_sinks, priv->child_count)) {
+        for (i = 0; i < priv->child_count; i++) {
+            if (locked_on[i]) {
+                sources[i] = 0;
+                healed_sinks[i] = 1;
+            }
+        }
+        return -1;
+    }
+
     return source;
 }
 
@@ -582,7 +598,7 @@ afr_selfheal_entry_dirent(call_frame_t *frame, xlator_t *this, fd_t *fd,
     ret = afr_selfheal_entrylk(frame, this, fd->inode, this->name, NULL,
                                locked_on);
     {
-        if (ret < AFR_SH_MIN_PARTICIPANTS) {
+        if (ret < priv->child_count) {
             gf_msg_debug(this->name, 0,
                          "%s: Skipping "
                          "entry self-heal as only %d sub-volumes "
@@ -976,7 +992,7 @@ __afr_selfheal_entry(call_frame_t *frame, xlator_t *this, fd_t *fd,
     ret = afr_selfheal_entrylk(frame, this, fd->inode, this->name, NULL,
                                data_lock);
     {
-        if (ret < AFR_SH_MIN_PARTICIPANTS) {
+        if (ret < priv->child_count) {
             gf_msg_debug(this->name, 0,
                          "%s: Skipping "
                          "entry self-heal as only %d sub-volumes could "
@@ -1100,7 +1116,7 @@ afr_selfheal_entry(call_frame_t *frame, xlator_t *this, inode_t *inode)
     ret = afr_selfheal_tie_breaker_entrylk(frame, this, inode, priv->sh_domain,
                                            NULL, locked_on);
     {
-        if (ret < AFR_SH_MIN_PARTICIPANTS) {
+        if (ret < priv->child_count) {
             gf_msg_debug(this->name, 0,
                          "%s: Skipping "
                          "entry self-heal as only %d sub-volumes could "

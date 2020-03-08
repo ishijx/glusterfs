@@ -10,17 +10,17 @@
 
 #include "dht-common.h"
 
-int
+static int
 dht_writev2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret);
-int
+static int
 dht_truncate2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret);
-int
+static int
 dht_setattr2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret);
-int
+static int
 dht_fallocate2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret);
-int
+static int
 dht_discard2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret);
-int
+static int
 dht_zerofill2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret);
 
 int
@@ -49,7 +49,7 @@ dht_writev_cbk(call_frame_t *frame, void *cookie, xlator_t *this, int op_ret,
      * We only check once as this could be a valid bad fd error.
      */
 
-    if (op_ret == -1 && (op_errno == EBADF) && !(local->fd_checked)) {
+    if (dht_check_remote_fd_failed_error(local, op_ret, op_errno)) {
         ret = dht_check_and_open_fd_on_subvol(this, frame);
         if (ret)
             goto out;
@@ -142,7 +142,7 @@ out:
     return 0;
 }
 
-int
+static int
 dht_writev2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret)
 {
     dht_local_t *local = NULL;
@@ -262,8 +262,8 @@ dht_truncate_cbk(call_frame_t *frame, void *cookie, xlator_t *this, int op_ret,
      * We only check once as this could actually be a valid error.
      */
 
-    if ((local->fop == GF_FOP_FTRUNCATE) && (op_ret == -1) &&
-        ((op_errno == EBADF) || (op_errno == EINVAL)) && !(local->fd_checked)) {
+    if ((local->fop == GF_FOP_FTRUNCATE) &&
+        dht_check_remote_fd_failed_error(local, op_ret, op_errno)) {
         ret = dht_check_and_open_fd_on_subvol(this, frame);
         if (ret)
             goto out;
@@ -336,7 +336,7 @@ err:
     return 0;
 }
 
-int
+static int
 dht_truncate2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret)
 {
     dht_local_t *local = NULL;
@@ -489,7 +489,7 @@ dht_fallocate_cbk(call_frame_t *frame, void *cookie, xlator_t *this, int op_ret,
      * We only check once as this could actually be a valid error.
      */
 
-    if ((op_ret == -1) && (op_errno == EBADF) && !(local->fd_checked)) {
+    if (dht_check_remote_fd_failed_error(local, op_ret, op_errno)) {
         ret = dht_check_and_open_fd_on_subvol(this, frame);
         if (ret)
             goto out;
@@ -555,7 +555,7 @@ err:
     return 0;
 }
 
-int
+static int
 dht_fallocate2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret)
 {
     dht_local_t *local = NULL;
@@ -666,7 +666,7 @@ dht_discard_cbk(call_frame_t *frame, void *cookie, xlator_t *this, int op_ret,
      * and a lookup updated the cached subvol in the inode ctx.
      * We only check once as this could actually be a valid error.
      */
-    if ((op_ret == -1) && (op_errno == EBADF) && !(local->fd_checked)) {
+    if (dht_check_remote_fd_failed_error(local, op_ret, op_errno)) {
         ret = dht_check_and_open_fd_on_subvol(this, frame);
         if (ret)
             goto out;
@@ -731,7 +731,7 @@ err:
     return 0;
 }
 
-int
+static int
 dht_discard2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret)
 {
     dht_local_t *local = NULL;
@@ -838,7 +838,7 @@ dht_zerofill_cbk(call_frame_t *frame, void *cookie, xlator_t *this, int op_ret,
      * and a lookup updated the cached subvol in the inode ctx.
      * We only check once as this could actually be a valid error.
      */
-    if ((op_ret == -1) && (op_errno == EBADF) && !(local->fd_checked)) {
+    if (dht_check_remote_fd_failed_error(local, op_ret, op_errno)) {
         ret = dht_check_and_open_fd_on_subvol(this, frame);
         if (ret)
             goto out;
@@ -902,7 +902,7 @@ err:
     return 0;
 }
 
-int
+static int
 dht_zerofill2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret)
 {
     dht_local_t *local = NULL;
@@ -1005,8 +1005,8 @@ dht_file_setattr_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
 
     local->op_errno = op_errno;
 
-    if ((local->fop == GF_FOP_FSETATTR) && (op_ret == -1) &&
-        (op_errno == EBADF) && !(local->fd_checked)) {
+    if ((local->fop == GF_FOP_FSETATTR) &&
+        dht_check_remote_fd_failed_error(local, op_ret, op_errno)) {
         ret = dht_check_and_open_fd_on_subvol(this, frame);
         if (ret)
             goto out;
@@ -1049,7 +1049,7 @@ out:
     return 0;
 }
 
-int
+static int
 dht_setattr2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret)
 {
     dht_local_t *local = NULL;

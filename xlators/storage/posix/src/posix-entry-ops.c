@@ -26,7 +26,6 @@
 #include <signal.h>
 #include <sys/uio.h>
 #include <unistd.h>
-#include <ftw.h>
 
 #ifndef GF_BSD_HOST_OS
 #include <alloca.h>
@@ -87,7 +86,7 @@ extern char *marker_xattrs[];
 
 #endif
 
-gf_boolean_t
+static gf_boolean_t
 posix_symlinks_match(xlator_t *this, loc_t *loc, uuid_t gfid)
 {
     struct posix_private *priv = NULL;
@@ -108,7 +107,7 @@ posix_symlinks_match(xlator_t *this, loc_t *loc, uuid_t gfid)
              loc->pargfid[0], loc->pargfid[1], uuid_utoa(loc->pargfid),
              loc->name);
 
-    MAKE_HANDLE_GFID_PATH(dir_handle, this, gfid, NULL);
+    MAKE_HANDLE_GFID_PATH(dir_handle, this, gfid);
     len = sys_readlink(dir_handle, linkname_actual, PATH_MAX);
     if (len < 0 || len == PATH_MAX) {
         if (len == PATH_MAX) {
@@ -130,12 +129,12 @@ out:
     return ret;
 }
 
-dict_t *
+static dict_t *
 posix_dict_set_nlink(dict_t *req, dict_t *res, int32_t nlink)
 {
     int ret = -1;
 
-    if (req == NULL || !dict_get(req, GF_REQUEST_LINK_COUNT_XDATA))
+    if (req == NULL || !dict_get_sizen(req, GF_REQUEST_LINK_COUNT_XDATA))
         goto out;
 
     if (res == NULL)
@@ -198,7 +197,7 @@ posix_lookup(call_frame_t *frame, xlator_t *this, loc_t *loc, dict_t *xdata)
         goto out;
     }
 
-    op_ret = dict_get_int32(xdata, GF_GFIDLESS_LOOKUP, &gfidless);
+    op_ret = dict_get_int32_sizen(xdata, GF_GFIDLESS_LOOKUP, &gfidless);
     op_ret = -1;
     if (gf_uuid_is_null(loc->pargfid) || (loc->name == NULL)) {
         /* nameless lookup */
@@ -257,7 +256,7 @@ posix_lookup(call_frame_t *frame, xlator_t *this, loc_t *loc, dict_t *xdata)
         posix_cs_maintenance(this, NULL, loc, NULL, &buf, real_path, xdata,
                              &xattr, _gf_true);
 
-        if (dict_get(xdata, GF_CLEAN_WRITE_PROTECTION)) {
+        if (dict_get_sizen(xdata, GF_CLEAN_WRITE_PROTECTION)) {
             ret = sys_lremovexattr(real_path, GF_PROTECT_FROM_EXTERNAL_WRITES);
             if (ret == -1 && (errno != ENODATA && errno != ENOATTR))
                 gf_msg(this->name, GF_LOG_ERROR, P_MSG_XATTR_NOT_REMOVED, errno,
@@ -331,6 +330,38 @@ out:
     return 0;
 }
 
+static int32_t
+posix_set_gfid2path_xattr(xlator_t *this, const char *path, uuid_t pgfid,
+                          const char *bname)
+{
+    char xxh64[GF_XXH64_DIGEST_LENGTH * 2 + 1] = {
+        0,
+    };
+    char pgfid_bname[1024] = {
+        0,
+    };
+    char *key = NULL;
+    const size_t key_size = GFID2PATH_XATTR_KEY_PREFIX_LENGTH +
+                            GF_XXH64_DIGEST_LENGTH * 2 + 1;
+    int ret = 0;
+    int len;
+
+    len = snprintf(pgfid_bname, sizeof(pgfid_bname), "%s/%s", uuid_utoa(pgfid),
+                   bname);
+    gf_xxh64_wrapper((unsigned char *)pgfid_bname, len,
+                     GF_XXHSUM64_DEFAULT_SEED, xxh64);
+    key = alloca(key_size);
+    snprintf(key, key_size, GFID2PATH_XATTR_KEY_PREFIX "%s", xxh64);
+
+    ret = sys_lsetxattr(path, key, pgfid_bname, len, XATTR_CREATE);
+    if (ret == -1) {
+        gf_msg(this->name, GF_LOG_WARNING, errno, P_MSG_PGFID_OP,
+               "setting gfid2path xattr failed on %s: key = %s ", path, key);
+    }
+
+    return ret;
+}
+
 int
 posix_mknod(call_frame_t *frame, xlator_t *this, loc_t *loc, mode_t mode,
             dev_t dev, mode_t umask, dict_t *xdata)
@@ -370,7 +401,8 @@ posix_mknod(call_frame_t *frame, xlator_t *this, loc_t *loc, mode_t mode,
 
     priv = this->private;
     VALIDATE_OR_GOTO(priv, out);
-    GFID_NULL_CHECK_AND_GOTO(frame, this, loc, xdata, op_ret, op_errno, out);
+    GFID_NULL_CHECK_AND_GOTO(frame, this, loc, xdata, op_ret, op_errno,
+                             uuid_req, out);
     MAKE_ENTRY_HANDLE(real_path, par_path, this, loc, NULL);
 
     mode_bit = (priv->create_mask & mode) | priv->force_create_mode;
@@ -402,16 +434,22 @@ posix_mknod(call_frame_t *frame, xlator_t *this, loc_t *loc, mode_t mode,
     /* Check if the 'gfid' already exists, because this mknod may be an
        internal call from distribute for creating 'linkfile', and that
        linkfile may be for a hardlinked file */
-    if (dict_get(xdata, GLUSTERFS_INTERNAL_FOP_KEY)) {
-        dict_del(xdata, GLUSTERFS_INTERNAL_FOP_KEY);
-        op_ret = dict_get_gfuuid(xdata, "gfid-req", &uuid_req);
-        if (op_ret) {
-            gf_msg_debug(this->name, 0,
-                         "failed to get the gfid from "
-                         "dict for %s",
-                         loc->path);
-            goto real_op;
+    if (dict_get_sizen(xdata, GLUSTERFS_INTERNAL_FOP_KEY)) {
+        dict_del_sizen(xdata, GLUSTERFS_INTERNAL_FOP_KEY);
+        /* trash xlator did not bring the uuid_via the call
+         * to GFID_NULL_CHECK_AND_GOTO() above.
+         * Fetch it explicitly here.
+         */
+        if (frame->root->pid == GF_SERVER_PID_TRASH) {
+            op_ret = dict_get_gfuuid(xdata, "gfid-req", &uuid_req);
+            if (op_ret) {
+                gf_msg_debug(this->name, 0,
+                             "failed to get the gfid from dict for %s",
+                             loc->path);
+                goto real_op;
+            }
         }
+
         op_ret = posix_create_link_if_gfid_exists(this, uuid_req, real_path,
                                                   loc->inode->table);
         if (!op_ret) {
@@ -569,6 +607,7 @@ posix_mkdir(call_frame_t *frame, xlator_t *this, loc_t *loc, mode_t mode,
     int32_t op_errno = 0;
     char *real_path = NULL, *gfid_path = NULL;
     char *par_path = NULL, *xattr_name = NULL;
+    int xattr_name_len;
     struct iatt stbuf = {
         0,
     };
@@ -586,13 +625,9 @@ posix_mkdir(call_frame_t *frame, xlator_t *this, loc_t *loc, mode_t mode,
     };
     ssize_t size = 0;
     dict_t *xdata_rsp = NULL;
-    void *disk_xattr = NULL;
+    char *disk_xattr = NULL;
     data_t *arg_data = NULL;
     char pgfid[GF_UUID_BUF_SIZE] = {0};
-    char value_buf[4096] = {
-        0,
-    };
-    gf_boolean_t have_val = _gf_false;
     mode_t mode_bit = 0;
 
     DECLARE_OLD_FS_ID_VAR;
@@ -616,7 +651,8 @@ posix_mkdir(call_frame_t *frame, xlator_t *this, loc_t *loc, mode_t mode,
 
     priv = this->private;
     VALIDATE_OR_GOTO(priv, out);
-    GFID_NULL_CHECK_AND_GOTO(frame, this, loc, xdata, op_ret, op_errno, out);
+    GFID_NULL_CHECK_AND_GOTO(frame, this, loc, xdata, op_ret, op_errno,
+                             uuid_req, out);
     DISK_SPACE_CHECK_AND_GOTO(frame, priv, xdata, op_ret, op_errno, out);
 
     MAKE_ENTRY_HANDLE(real_path, par_path, this, loc, NULL);
@@ -625,11 +661,6 @@ posix_mkdir(call_frame_t *frame, xlator_t *this, loc_t *loc, mode_t mode,
         op_errno = ESTALE;
         goto out;
     }
-
-    if (loc->parent)
-        gf_uuid_unparse(loc->parent->gfid, pgfid);
-    else
-        gf_uuid_unparse(loc->pargfid, pgfid);
 
     gid = frame->root->gid;
 
@@ -642,8 +673,7 @@ posix_mkdir(call_frame_t *frame, xlator_t *this, loc_t *loc, mode_t mode,
     mode = posix_override_umask(mode, mode_bit);
 
     if (xdata) {
-        op_ret = dict_get_gfuuid(xdata, "gfid-req", &uuid_req);
-        if (!op_ret && !gf_uuid_compare(stbuf.ia_gfid, uuid_req)) {
+        if (!gf_uuid_compare(stbuf.ia_gfid, uuid_req)) {
             op_ret = -1;
             op_errno = EEXIST;
             goto out;
@@ -653,12 +683,13 @@ posix_mkdir(call_frame_t *frame, xlator_t *this, loc_t *loc, mode_t mode,
     if (!gf_uuid_is_null(uuid_req)) {
         op_ret = posix_istat(this, loc->inode, uuid_req, NULL, &stbuf);
         if ((op_ret == 0) && IA_ISDIR(stbuf.ia_type)) {
-            size = posix_handle_path(this, uuid_req, NULL, NULL, 0);
-            if (size > 0)
-                gfid_path = alloca(size);
-
-            if (gfid_path)
-                posix_handle_path(this, uuid_req, NULL, gfid_path, size);
+            gfid_path = alloca(PATH_MAX);
+            size = posix_handle_path(this, uuid_req, NULL, gfid_path, PATH_MAX);
+            if (size <= 0) {
+                op_errno = ESTALE;
+                op_ret = -1;
+                goto out;
+            }
 
             if (frame->root->pid != GF_CLIENT_PID_SELF_HEALD) {
                 gf_msg(this->name, GF_LOG_WARNING, 0, P_MSG_DIR_OF_SAME_ID,
@@ -707,25 +738,53 @@ posix_mkdir(call_frame_t *frame, xlator_t *this, loc_t *loc, mode_t mode,
         mode |= S_ISGID;
     }
 
-    op_ret = dict_get_str(xdata, GF_PREOP_PARENT_KEY, &xattr_name);
+    op_ret = dict_get_str_sizen(xdata, GF_PREOP_PARENT_KEY, &xattr_name);
     if (xattr_name != NULL) {
-        arg_data = dict_get(xdata, xattr_name);
+        xattr_name_len = strlen(xattr_name);
+        arg_data = dict_getn(xdata, xattr_name, xattr_name_len);
         if (arg_data) {
-            size = sys_lgetxattr(par_path, xattr_name, value_buf,
-                                 sizeof(value_buf) - 1);
-            if (size >= 0) {
-                have_val = _gf_true;
-            } else {
-                if (errno == ERANGE) {
-                    gf_msg(this->name, GF_LOG_INFO, errno,
-                           P_MSG_PREOP_CHECK_FAILED,
-                           "mkdir (%s/%s): getxattr on key "
-                           "(%s) path (%s) failed due to "
-                           " buffer overflow",
-                           pgfid, loc->name, xattr_name, par_path);
-                    size = sys_lgetxattr(par_path, xattr_name, NULL, 0);
+            if (loc->parent)
+                gf_uuid_unparse(loc->parent->gfid, pgfid);
+            else
+                gf_uuid_unparse(loc->pargfid, pgfid);
+
+            size = 256;
+            disk_xattr = GF_MALLOC(size + 1, gf_posix_mt_char);
+            if (!disk_xattr) {
+                op_ret = -1;
+                op_errno = errno;
+                gf_msg(this->name, GF_LOG_ERROR, errno,
+                       P_MSG_PREOP_CHECK_FAILED,
+                       "mkdir (%s/%s): GF_MALLOC failed during"
+                       " preop of mkdir (%s)",
+                       pgfid, loc->name, real_path);
+                goto out;
+            }
+            disk_xattr[size] = '\0';
+
+            size = sys_lgetxattr(par_path, xattr_name, disk_xattr, size);
+            if (size == -1) {
+                if (disk_xattr) {
+                    GF_FREE(disk_xattr);
+                    disk_xattr = NULL;
                 }
-                if (size < 0) {
+                if (errno != ERANGE) {
+                    op_ret = -1;
+                    op_errno = errno;
+                    gf_msg(this->name, GF_LOG_ERROR, errno,
+                           P_MSG_PREOP_CHECK_FAILED,
+                           "mkdir (%s/%s): getxattr failed during"
+                           " preop of mkdir (%s).",
+                           pgfid, loc->name, real_path);
+                    goto out;
+                }
+                gf_msg(this->name, GF_LOG_INFO, errno, P_MSG_PREOP_CHECK_FAILED,
+                       "mkdir (%s/%s): getxattr on key "
+                       "(%s) path (%s) failed due to "
+                       " buffer overflow",
+                       pgfid, loc->name, xattr_name, par_path);
+                size = sys_lgetxattr(par_path, xattr_name, NULL, 0);
+                if (size == -1) {
                     op_ret = -1;
                     op_errno = errno;
                     gf_msg(this->name, GF_LOG_ERROR, errno,
@@ -735,23 +794,20 @@ posix_mkdir(call_frame_t *frame, xlator_t *this, loc_t *loc, mode_t mode,
                            pgfid, loc->name, xattr_name, par_path);
                     goto out;
                 }
-            }
-            disk_xattr = alloca(size);
-            if (disk_xattr == NULL) {
-                op_ret = -1;
-                op_errno = errno;
-                gf_msg(this->name, GF_LOG_ERROR, errno,
-                       P_MSG_PREOP_CHECK_FAILED,
-                       "mkdir (%s/%s): alloca failed during"
-                       " preop of mkdir (%s)",
-                       pgfid, loc->name, real_path);
-                goto out;
-            }
-            if (have_val) {
-                memcpy(disk_xattr, value_buf, size);
-            } else {
+                disk_xattr = GF_MALLOC(size + 1, gf_posix_mt_char);
+                if (!disk_xattr) {
+                    op_ret = -1;
+                    op_errno = errno;
+                    gf_msg(this->name, GF_LOG_ERROR, errno,
+                           P_MSG_PREOP_CHECK_FAILED,
+                           "mkdir (%s/%s): GF_MALLOC failed during"
+                           " preop of mkdir (%s)",
+                           pgfid, loc->name, real_path);
+                    goto out;
+                }
+                disk_xattr[size] = '\0';
                 size = sys_lgetxattr(par_path, xattr_name, disk_xattr, size);
-                if (size < 0) {
+                if (size == -1) {
                     op_errno = errno;
                     gf_msg(this->name, GF_LOG_ERROR, errno,
                            P_MSG_PREOP_CHECK_FAILED,
@@ -791,10 +847,10 @@ posix_mkdir(call_frame_t *frame, xlator_t *this, loc_t *loc, mode_t mode,
                 goto out;
             }
 
-            dict_del(xdata, xattr_name);
+            dict_deln(xdata, xattr_name, xattr_name_len);
         }
 
-        dict_del(xdata, GF_PREOP_PARENT_KEY);
+        dict_del_sizen(xdata, GF_PREOP_PARENT_KEY);
     }
 
     op_ret = sys_mkdir(real_path, mode);
@@ -864,6 +920,9 @@ posix_mkdir(call_frame_t *frame, xlator_t *this, loc_t *loc, mode_t mode,
 out:
     SET_TO_OLD_FS_ID();
 
+    if (disk_xattr)
+        GF_FREE(disk_xattr);
+
     if (op_ret < 0) {
         if (entry_created)
             sys_rmdir(real_path);
@@ -882,7 +941,7 @@ out:
     return 0;
 }
 
-int
+static int
 posix_add_unlink_to_ctx(inode_t *inode, xlator_t *this, char *unlink_path)
 {
     uint64_t ctx = GF_UNLINK_FALSE;
@@ -905,17 +964,17 @@ out:
     return ret;
 }
 
-int32_t
+static int32_t
 posix_move_gfid_to_unlink(xlator_t *this, uuid_t gfid, loc_t *loc)
 {
     char *unlink_path = NULL;
     char *gfid_path = NULL;
-    int ret = 0;
+    int ret = -1;
     struct posix_private *priv_posix = NULL;
 
     priv_posix = (struct posix_private *)this->private;
 
-    MAKE_HANDLE_GFID_PATH(gfid_path, this, gfid, NULL);
+    MAKE_HANDLE_GFID_PATH(gfid_path, this, gfid);
 
     POSIX_GET_FILE_UNLINK_PATH(priv_posix->base_path, loc->inode->gfid,
                                unlink_path);
@@ -939,7 +998,7 @@ out:
     return ret;
 }
 
-int32_t
+static int32_t
 posix_unlink_gfid_handle_and_entry(call_frame_t *frame, xlator_t *this,
                                    const char *real_path, struct iatt *stbuf,
                                    int32_t *op_errno, loc_t *loc,
@@ -982,6 +1041,8 @@ posix_unlink_gfid_handle_and_entry(call_frame_t *frame, xlator_t *this,
          */
         ret = posix_pstat(this, NULL, loc->gfid, real_path, &prebuf, _gf_true);
         if (ret) {
+            UNLOCK(&loc->inode->lock);
+            locked = _gf_false;
             gf_msg(this->name, GF_LOG_ERROR, errno, P_MSG_LSTAT_FAILED,
                    "lstat on %s failed", real_path);
             goto err;
@@ -990,17 +1051,18 @@ posix_unlink_gfid_handle_and_entry(call_frame_t *frame, xlator_t *this,
 
     /* Unlink the actual file */
     ret = sys_unlink(real_path);
+
+    if (locked) {
+        UNLOCK(&loc->inode->lock);
+        locked = _gf_false;
+    }
+
     if (ret == -1) {
         if (op_errno)
             *op_errno = errno;
         gf_msg(this->name, GF_LOG_ERROR, errno, P_MSG_UNLINK_FAILED,
                "unlink of %s failed", real_path);
         goto err;
-    }
-
-    if (locked) {
-        UNLOCK(&loc->inode->lock);
-        locked = _gf_false;
     }
 
     if (update_ctime) {
@@ -1022,10 +1084,10 @@ err:
     return -1;
 }
 
-gf_boolean_t
+static gf_boolean_t
 posix_skip_non_linkto_unlink(dict_t *xdata, loc_t *loc, char *key,
-                             const char *linkto_xattr, struct iatt *stbuf,
-                             const char *real_path)
+                             const int keylen, const char *linkto_xattr,
+                             struct iatt *stbuf, const char *real_path)
 {
     gf_boolean_t skip_unlink = _gf_false;
     gf_boolean_t is_dht_linkto_file = _gf_false;
@@ -1033,7 +1095,7 @@ posix_skip_non_linkto_unlink(dict_t *xdata, loc_t *loc, char *key,
     ssize_t xattr_size = -1;
     int op_ret = -1;
 
-    op_ret = dict_get_int32(xdata, key, &unlink_if_linkto);
+    op_ret = dict_get_int32n(xdata, key, keylen, &unlink_if_linkto);
 
     if (!op_ret && unlink_if_linkto) {
         is_dht_linkto_file = IS_DHT_LINKFILE_MODE(stbuf);
@@ -1044,16 +1106,48 @@ posix_skip_non_linkto_unlink(dict_t *xdata, loc_t *loc, char *key,
 
         xattr_size = sys_lgetxattr(real_path, linkto_xattr, NULL, 0);
 
+        UNLOCK(&loc->inode->lock);
+
         if (xattr_size <= 0)
             skip_unlink = _gf_true;
-
-        UNLOCK(&loc->inode->lock);
 
         gf_msg("posix", GF_LOG_INFO, 0, P_MSG_XATTR_STATUS,
                "linkto_xattr status: %" PRIu32 " for %s", skip_unlink,
                real_path);
     }
     return skip_unlink;
+}
+
+static int32_t
+posix_remove_gfid2path_xattr(xlator_t *this, const char *path, uuid_t pgfid,
+                             const char *bname)
+{
+    char xxh64[GF_XXH64_DIGEST_LENGTH * 2 + 1] = {
+        0,
+    };
+    char pgfid_bname[1024] = {
+        0,
+    };
+    int ret = 0;
+    char *key = NULL;
+    const size_t key_size = GFID2PATH_XATTR_KEY_PREFIX_LENGTH +
+                            GF_XXH64_DIGEST_LENGTH * 2 + 1;
+    int len;
+
+    len = snprintf(pgfid_bname, sizeof(pgfid_bname), "%s/%s", uuid_utoa(pgfid),
+                   bname);
+    gf_xxh64_wrapper((unsigned char *)pgfid_bname, len,
+                     GF_XXHSUM64_DEFAULT_SEED, xxh64);
+    key = alloca(key_size);
+    snprintf(key, key_size, GFID2PATH_XATTR_KEY_PREFIX "%s", xxh64);
+
+    ret = sys_lremovexattr(path, key);
+    if (ret == -1) {
+        gf_msg(this->name, GF_LOG_WARNING, errno, P_MSG_PGFID_OP,
+               "removing gfid2path xattr failed on %s: key = %s", path, key);
+    }
+
+    return ret;
 }
 
 int32_t
@@ -1085,9 +1179,6 @@ posix_unlink(call_frame_t *frame, xlator_t *this, loc_t *loc, int xflag,
     int32_t skip_unlink = 0;
     int32_t fdstat_requested = 0;
     dict_t *unwind_dict = NULL;
-    void *uuid = NULL;
-    char uuid_str[GF_UUID_BUF_SIZE] = {0};
-    char gfid_str[GF_UUID_BUF_SIZE] = {0};
     gf_boolean_t get_link_count = _gf_false;
     posix_inode_ctx_t *ctx = NULL;
 
@@ -1117,22 +1208,8 @@ posix_unlink(call_frame_t *frame, xlator_t *this, loc_t *loc, int xflag,
 
     priv = this->private;
 
-    op_ret = dict_get_ptr(xdata, TIER_LINKFILE_GFID, &uuid);
-
-    if (!op_ret && gf_uuid_compare(uuid, stbuf.ia_gfid)) {
-        op_errno = ENOENT;
-        op_ret = -1;
-        gf_uuid_unparse(uuid, uuid_str);
-        gf_uuid_unparse(stbuf.ia_gfid, gfid_str);
-        gf_msg_debug(this->name, op_errno,
-                     "Mismatch in gfid for path "
-                     "%s. Aborting the unlink. loc->gfid = %s, "
-                     "stbuf->ia_gfid = %s",
-                     real_path, uuid_str, gfid_str);
-        goto out;
-    }
-
-    op_ret = dict_get_int32(xdata, DHT_SKIP_OPEN_FD_UNLINK, &check_open_fd);
+    op_ret = dict_get_int32_sizen(xdata, DHT_SKIP_OPEN_FD_UNLINK,
+                                  &check_open_fd);
 
     if (!op_ret && check_open_fd) {
         LOCK(&loc->inode->lock);
@@ -1159,10 +1236,8 @@ posix_unlink(call_frame_t *frame, xlator_t *this, loc_t *loc, int xflag,
      * we don't need to call second function, skip unlink.
      */
     skip_unlink = posix_skip_non_linkto_unlink(
-        xdata, loc, DHT_SKIP_NON_LINKTO_UNLINK, DHT_LINKTO, &stbuf, real_path);
-    skip_unlink = skip_unlink || posix_skip_non_linkto_unlink(
-                                     xdata, loc, TIER_SKIP_NON_LINKTO_UNLINK,
-                                     TIER_LINKTO, &stbuf, real_path);
+        xdata, loc, DHT_SKIP_NON_LINKTO_UNLINK,
+        SLEN(DHT_SKIP_NON_LINKTO_UNLINK), DHT_LINKTO, &stbuf, real_path);
     if (skip_unlink) {
         op_ret = -1;
         op_errno = EBUSY;
@@ -1170,7 +1245,7 @@ posix_unlink(call_frame_t *frame, xlator_t *this, loc_t *loc, int xflag,
     }
 
     if (IA_ISREG(loc->inode->ia_type) && xdata &&
-        dict_get(xdata, DHT_IATT_IN_XDATA_KEY)) {
+        dict_get_sizen(xdata, DHT_IATT_IN_XDATA_KEY)) {
         fdstat_requested = 1;
     }
 
@@ -1230,7 +1305,7 @@ posix_unlink(call_frame_t *frame, xlator_t *this, loc_t *loc, int xflag,
         goto out;
     }
 
-    if (xdata && dict_get(xdata, GF_GET_FILE_BLOCK_COUNT)) {
+    if (xdata && dict_get_sizen(xdata, GF_GET_FILE_BLOCK_COUNT)) {
         ret = dict_set_uint64(unwind_dict, GF_GET_FILE_BLOCK_COUNT,
                               stbuf.ia_blocks);
         if (ret)
@@ -1238,7 +1313,7 @@ posix_unlink(call_frame_t *frame, xlator_t *this, loc_t *loc, int xflag,
                    "Failed to set %s in rsp dict", GF_GET_FILE_BLOCK_COUNT);
     }
 
-    if (xdata && dict_get(xdata, GET_LINK_COUNT))
+    if (xdata && dict_get_sizen(xdata, GET_LINK_COUNT))
         get_link_count = _gf_true;
     op_ret = posix_unlink_gfid_handle_and_entry(frame, this, real_path, &stbuf,
                                                 &op_errno, loc, get_link_count,
@@ -1359,13 +1434,12 @@ posix_rmdir(call_frame_t *frame, xlator_t *this, loc_t *loc, int flags,
     }
 
     if (flags) {
-        gfid_str = uuid_utoa(stbuf.ia_gfid);
-
         op_ret = sys_mkdir(priv->trash_path, 0755);
         if (errno != EEXIST && op_ret == -1) {
             gf_msg(this->name, GF_LOG_ERROR, errno, P_MSG_MKDIR_FAILED,
                    "mkdir of %s failed", priv->trash_path);
         } else {
+            gfid_str = uuid_utoa(stbuf.ia_gfid);
             (void)snprintf(tmp_path, sizeof(tmp_path), "%s/%s",
                            priv->trash_path, gfid_str);
             gf_msg_debug(this->name, 0, "Moving %s to %s", real_path, tmp_path);
@@ -1445,6 +1519,9 @@ posix_symlink(call_frame_t *frame, xlator_t *this, const char *linkname,
     char *pgfid_xattr_key = NULL;
     int32_t nlink_samepgfid = 0;
     gf_boolean_t entry_created = _gf_false, gfid_set = _gf_false;
+    uuid_t uuid_req = {
+        0,
+    };
 
     DECLARE_OLD_FS_ID_VAR;
 
@@ -1455,7 +1532,8 @@ posix_symlink(call_frame_t *frame, xlator_t *this, const char *linkname,
 
     priv = this->private;
     VALIDATE_OR_GOTO(priv, out);
-    GFID_NULL_CHECK_AND_GOTO(frame, this, loc, xdata, op_ret, op_errno, out);
+    GFID_NULL_CHECK_AND_GOTO(frame, this, loc, xdata, op_ret, op_errno,
+                             uuid_req, out);
     DISK_SPACE_CHECK_AND_GOTO(frame, priv, xdata, op_ret, op_errno, out);
 
     MAKE_ENTRY_HANDLE(real_path, par_path, this, loc, &stbuf);
@@ -1628,7 +1706,6 @@ posix_rename(call_frame_t *frame, xlator_t *this, loc_t *oldloc, loc_t *newloc,
 
     priv = this->private;
     VALIDATE_OR_GOTO(priv, out);
-    DISK_SPACE_CHECK_AND_GOTO(frame, priv, xdata, op_ret, op_errno, out);
 
     SET_FS_ID(frame->root->uid, frame->root->gid);
     MAKE_ENTRY_HANDLE(real_oldpath, par_oldpath, this, oldloc, NULL);
@@ -2064,6 +2141,11 @@ posix_create(call_frame_t *frame, xlator_t *this, loc_t *loc, int32_t flags,
     char *pgfid_xattr_key = NULL;
     gf_boolean_t entry_created = _gf_false, gfid_set = _gf_false;
     mode_t mode_bit = 0;
+    uuid_t uuid_req = {
+        0,
+    };
+
+    dict_t *xdata_rsp = dict_ref(xdata);
 
     DECLARE_OLD_FS_ID_VAR;
 
@@ -2075,7 +2157,8 @@ posix_create(call_frame_t *frame, xlator_t *this, loc_t *loc, int32_t flags,
 
     priv = this->private;
     VALIDATE_OR_GOTO(priv, out);
-    GFID_NULL_CHECK_AND_GOTO(frame, this, loc, xdata, op_ret, op_errno, out);
+    GFID_NULL_CHECK_AND_GOTO(frame, this, loc, xdata, op_ret, op_errno,
+                             uuid_req, out);
     DISK_SPACE_CHECK_AND_GOTO(frame, priv, xdata, op_ret, op_errno, out);
 
     MAKE_ENTRY_HANDLE(real_path, par_path, this, loc, &stbuf);
@@ -2111,6 +2194,28 @@ posix_create(call_frame_t *frame, xlator_t *this, loc_t *loc, int32_t flags,
     op_ret = posix_pstat(this, loc->inode, NULL, real_path, &stbuf, _gf_false);
     if ((op_ret == -1) && (errno == ENOENT)) {
         was_present = 0;
+    }
+
+    if (!was_present) {
+        if (posix_is_layout_stale(xdata, par_path, this)) {
+            op_ret = -1;
+            op_errno = EIO;
+            if (!xdata_rsp) {
+                xdata_rsp = dict_new();
+                if (!xdata_rsp) {
+                    op_errno = ENOMEM;
+                    goto out;
+                }
+            }
+
+            if (dict_set_int32_sizen(xdata_rsp, GF_PREOP_CHECK_FAILED, 1) ==
+                -1) {
+                gf_msg(this->name, GF_LOG_ERROR, errno, P_MSG_DICT_SET_FAILED,
+                       "setting key %s in dict failed", GF_PREOP_CHECK_FAILED);
+            }
+
+            goto out;
+        }
     }
 
     if (priv->o_direct)
@@ -2232,7 +2337,10 @@ out:
 
     STACK_UNWIND_STRICT(create, frame, op_ret, op_errno, fd,
                         (loc) ? loc->inode : NULL, &stbuf, &preparent,
-                        &postparent, xdata);
+                        &postparent, xdata_rsp);
+
+    if (xdata_rsp)
+        dict_unref(xdata_rsp);
 
     return 0;
 }

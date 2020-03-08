@@ -2336,7 +2336,7 @@ glusterd_store_retrieve_bricks(glusterd_volinfo_t *volinfo)
     glusterd_conf_t *priv = NULL;
     int32_t brick_count = 0;
     int32_t ta_brick_count = 0;
-    char tmpkey[4096] = {
+    char tmpkey[32] = {
         0,
     };
     gf_store_iter_t *tmpiter = NULL;
@@ -2648,17 +2648,18 @@ glusterd_store_retrieve_bricks(glusterd_volinfo_t *volinfo)
         goto out;
 
     if (volinfo->thin_arbiter_count == 1) {
+        snprintf(tmpkey, sizeof(tmpkey), "%s-%d",
+                 GLUSTERD_STORE_KEY_VOL_TA_BRICK, 0);
         while (ta_brick_count < volinfo->subvol_count) {
             ret = glusterd_brickinfo_new(&ta_brickinfo);
             if (ret)
                 goto out;
 
-            snprintf(tmpkey, sizeof(tmpkey), "%s-%d",
-                     GLUSTERD_STORE_KEY_VOL_TA_BRICK, 0);
-
             ret = gf_store_iter_get_matching(tmpiter, tmpkey, &tmpvalue);
 
             len = snprintf(path, sizeof(path), "%s/%s", brickdir, tmpvalue);
+            GF_FREE(tmpvalue);
+            tmpvalue = NULL;
             if ((len < 0) || (len >= sizeof(path))) {
                 ret = -1;
                 goto out;
@@ -2894,19 +2895,19 @@ glusterd_store_retrieve_node_state(glusterd_volinfo_t *volinfo)
             volinfo->rebal.op = atoi(value);
         } else if (!strncmp(key, GLUSTERD_STORE_KEY_VOL_DEFRAG_REB_FILES,
                             SLEN(GLUSTERD_STORE_KEY_VOL_DEFRAG_REB_FILES))) {
-            volinfo->rebal.rebalance_files = atoi(value);
+            sscanf(value, "%" PRIu64, &volinfo->rebal.rebalance_files);
         } else if (!strncmp(key, GLUSTERD_STORE_KEY_VOL_DEFRAG_SIZE,
                             SLEN(GLUSTERD_STORE_KEY_VOL_DEFRAG_SIZE))) {
-            volinfo->rebal.rebalance_data = atoi(value);
+            sscanf(value, "%" PRIu64, &volinfo->rebal.rebalance_data);
         } else if (!strncmp(key, GLUSTERD_STORE_KEY_VOL_DEFRAG_SCANNED,
                             SLEN(GLUSTERD_STORE_KEY_VOL_DEFRAG_SCANNED))) {
-            volinfo->rebal.lookedup_files = atoi(value);
+            sscanf(value, "%" PRIu64, &volinfo->rebal.lookedup_files);
         } else if (!strncmp(key, GLUSTERD_STORE_KEY_VOL_DEFRAG_FAILURES,
                             SLEN(GLUSTERD_STORE_KEY_VOL_DEFRAG_FAILURES))) {
-            volinfo->rebal.rebalance_failures = atoi(value);
+            sscanf(value, "%" PRIu64, &volinfo->rebal.rebalance_failures);
         } else if (!strncmp(key, GLUSTERD_STORE_KEY_VOL_DEFRAG_SKIPPED,
                             SLEN(GLUSTERD_STORE_KEY_VOL_DEFRAG_SKIPPED))) {
-            volinfo->rebal.skipped_files = atoi(value);
+            sscanf(value, "%" PRIu64, &volinfo->rebal.skipped_files);
         } else if (!strncmp(key, GLUSTERD_STORE_KEY_VOL_DEFRAG_RUN_TIME,
                             SLEN(GLUSTERD_STORE_KEY_VOL_DEFRAG_RUN_TIME))) {
             volinfo->rebal.rebalance_time = atoi(value);
@@ -3943,7 +3944,6 @@ out:
 int32_t
 glusterd_store_retrieve_missed_snaps_list(xlator_t *this)
 {
-    char buf[PATH_MAX] = "";
     char path[PATH_MAX] = "";
     char *snap_vol_id = NULL;
     char *missed_node_info = NULL;
@@ -3980,8 +3980,8 @@ glusterd_store_retrieve_missed_snaps_list(xlator_t *this)
     }
 
     do {
-        ret = gf_store_read_and_tokenize(
-            fp, buf, sizeof(buf), &missed_node_info, &value, &store_errno);
+        ret = gf_store_read_and_tokenize(fp, &missed_node_info, &value,
+                                         &store_errno);
         if (ret) {
             if (store_errno == GD_STORE_EOF) {
                 gf_msg_debug(this->name, 0, "EOF for missed_snap_list");

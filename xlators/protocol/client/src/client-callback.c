@@ -13,31 +13,28 @@
 #include <glusterfs/defaults.h>
 #include "client-messages.h"
 
-int
+static int
 client_cbk_null(struct rpc_clnt *rpc, void *mydata, void *data)
 {
-    gf_msg(THIS->name, GF_LOG_WARNING, 0, PC_MSG_FUNCTION_CALL_ERROR,
-           "this function should not be called");
+    gf_smsg(THIS->name, GF_LOG_WARNING, 0, PC_MSG_FUNCTION_CALL_ERROR, NULL);
     return 0;
 }
 
-int
+static int
 client_cbk_fetchspec(struct rpc_clnt *rpc, void *mydata, void *data)
 {
-    gf_msg(THIS->name, GF_LOG_WARNING, 0, PC_MSG_FUNCTION_CALL_ERROR,
-           "this function should not be called");
+    gf_smsg(THIS->name, GF_LOG_WARNING, 0, PC_MSG_FUNCTION_CALL_ERROR, NULL);
     return 0;
 }
 
-int
+static int
 client_cbk_ino_flush(struct rpc_clnt *rpc, void *mydata, void *data)
 {
-    gf_msg(THIS->name, GF_LOG_WARNING, 0, PC_MSG_FUNCTION_CALL_ERROR,
-           "this function should not be called");
+    gf_smsg(THIS->name, GF_LOG_WARNING, 0, PC_MSG_FUNCTION_CALL_ERROR, NULL);
     return 0;
 }
 
-int
+static int
 client_cbk_recall_lease(struct rpc_clnt *rpc, void *mydata, void *data)
 {
     int ret = -1;
@@ -54,8 +51,6 @@ client_cbk_recall_lease(struct rpc_clnt *rpc, void *mydata, void *data)
         },
     };
 
-    GF_VALIDATE_OR_GOTO("client-callback", rpc, out);
-    GF_VALIDATE_OR_GOTO("client-callback", mydata, out);
     GF_VALIDATE_OR_GOTO("client-callback", data, out);
 
     iov = (struct iovec *)data;
@@ -63,8 +58,8 @@ client_cbk_recall_lease(struct rpc_clnt *rpc, void *mydata, void *data)
                          (xdrproc_t)xdr_gfs3_recall_lease_req);
 
     if (ret < 0) {
-        gf_msg(THIS->name, GF_LOG_WARNING, -ret, PC_MSG_RECALL_LEASE_FAIL,
-               "XDR decode of recall lease failed.");
+        gf_smsg(THIS->name, GF_LOG_WARNING, -ret, PC_MSG_RECALL_LEASE_FAIL,
+                NULL);
         goto out;
     }
 
@@ -90,7 +85,7 @@ out:
     return ret;
 }
 
-int
+static int
 client_cbk_cache_invalidation(struct rpc_clnt *rpc, void *mydata, void *data)
 {
     int ret = -1;
@@ -107,7 +102,7 @@ client_cbk_cache_invalidation(struct rpc_clnt *rpc, void *mydata, void *data)
 
     gf_msg_trace(THIS->name, 0, "Upcall callback is called");
 
-    if (!rpc || !mydata || !data)
+    if (!data)
         goto out;
 
     iov = (struct iovec *)data;
@@ -115,8 +110,8 @@ client_cbk_cache_invalidation(struct rpc_clnt *rpc, void *mydata, void *data)
                          (xdrproc_t)xdr_gfs3_cbk_cache_invalidation_req);
 
     if (ret < 0) {
-        gf_msg(THIS->name, GF_LOG_WARNING, -ret, PC_MSG_CACHE_INVALIDATION_FAIL,
-               "XDR decode of cache_invalidation failed.");
+        gf_smsg(THIS->name, GF_LOG_WARNING, -ret,
+                PC_MSG_CACHE_INVALIDATION_FAIL, NULL);
         goto out;
     }
 
@@ -145,15 +140,13 @@ out:
     return 0;
 }
 
-int
+static int
 client_cbk_child_up(struct rpc_clnt *rpc, void *mydata, void *data)
 {
     clnt_conf_t *conf = NULL;
-    xlator_t *this = NULL;
+    xlator_t *this = THIS;
 
-    this = THIS;
     GF_VALIDATE_OR_GOTO("client", this, out);
-    GF_VALIDATE_OR_GOTO(this->name, rpc, out);
     conf = this->private;
     GF_VALIDATE_OR_GOTO(this->name, conf, out);
 
@@ -165,15 +158,13 @@ out:
     return 0;
 }
 
-int
+static int
 client_cbk_child_down(struct rpc_clnt *rpc, void *mydata, void *data)
 {
     clnt_conf_t *conf = NULL;
-    xlator_t *this = NULL;
+    xlator_t *this = THIS;
 
-    this = THIS;
     GF_VALIDATE_OR_GOTO("client", this, out);
-    GF_VALIDATE_OR_GOTO(this->name, rpc, out);
     conf = this->private;
     GF_VALIDATE_OR_GOTO(this->name, conf, out);
 
@@ -185,7 +176,7 @@ out:
     return 0;
 }
 
-int
+static int
 client_cbk_inodelk_contention(struct rpc_clnt *rpc, void *mydata, void *data)
 {
     int ret = -1;
@@ -204,8 +195,6 @@ client_cbk_inodelk_contention(struct rpc_clnt *rpc, void *mydata, void *data)
         },
     };
 
-    GF_VALIDATE_OR_GOTO("client-callback", rpc, out);
-    GF_VALIDATE_OR_GOTO("client-callback", mydata, out);
     GF_VALIDATE_OR_GOTO("client-callback", data, out);
 
     iov = (struct iovec *)data;
@@ -213,8 +202,8 @@ client_cbk_inodelk_contention(struct rpc_clnt *rpc, void *mydata, void *data)
                          (xdrproc_t)xdr_gfs4_inodelk_contention_req);
 
     if (ret < 0) {
-        gf_msg(THIS->name, GF_LOG_WARNING, -ret, PC_MSG_INODELK_CONTENTION_FAIL,
-               "XDR decode of inodelk contention failed.");
+        gf_smsg(THIS->name, GF_LOG_WARNING, -ret,
+                PC_MSG_INODELK_CONTENTION_FAIL, NULL);
         goto out;
     }
 
@@ -240,7 +229,7 @@ out:
     return ret;
 }
 
-int
+static int
 client_cbk_entrylk_contention(struct rpc_clnt *rpc, void *mydata, void *data)
 {
     int ret = -1;
@@ -257,8 +246,6 @@ client_cbk_entrylk_contention(struct rpc_clnt *rpc, void *mydata, void *data)
         },
     };
 
-    GF_VALIDATE_OR_GOTO("client-callback", rpc, out);
-    GF_VALIDATE_OR_GOTO("client-callback", mydata, out);
     GF_VALIDATE_OR_GOTO("client-callback", data, out);
 
     iov = (struct iovec *)data;
@@ -266,8 +253,8 @@ client_cbk_entrylk_contention(struct rpc_clnt *rpc, void *mydata, void *data)
                          (xdrproc_t)xdr_gfs4_entrylk_contention_req);
 
     if (ret < 0) {
-        gf_msg(THIS->name, GF_LOG_WARNING, -ret, PC_MSG_ENTRYLK_CONTENTION_FAIL,
-               "XDR decode of entrylk contention failed.");
+        gf_smsg(THIS->name, GF_LOG_WARNING, -ret,
+                PC_MSG_ENTRYLK_CONTENTION_FAIL, NULL);
         goto out;
     }
 
@@ -296,24 +283,24 @@ out:
     return ret;
 }
 
-rpcclnt_cb_actor_t gluster_cbk_actors[GF_CBK_MAXVALUE] = {
-    [GF_CBK_NULL] = {"NULL", GF_CBK_NULL, client_cbk_null},
-    [GF_CBK_FETCHSPEC] = {"FETCHSPEC", GF_CBK_FETCHSPEC, client_cbk_fetchspec},
-    [GF_CBK_INO_FLUSH] = {"INO_FLUSH", GF_CBK_INO_FLUSH, client_cbk_ino_flush},
+static rpcclnt_cb_actor_t gluster_cbk_actors[GF_CBK_MAXVALUE] = {
+    [GF_CBK_NULL] = {"NULL", client_cbk_null, GF_CBK_NULL},
+    [GF_CBK_FETCHSPEC] = {"FETCHSPEC", client_cbk_fetchspec, GF_CBK_FETCHSPEC},
+    [GF_CBK_INO_FLUSH] = {"INO_FLUSH", client_cbk_ino_flush, GF_CBK_INO_FLUSH},
     [GF_CBK_CACHE_INVALIDATION] = {"CACHE_INVALIDATION",
-                                   GF_CBK_CACHE_INVALIDATION,
-                                   client_cbk_cache_invalidation},
-    [GF_CBK_CHILD_UP] = {"CHILD_UP", GF_CBK_CHILD_UP, client_cbk_child_up},
-    [GF_CBK_CHILD_DOWN] = {"CHILD_DOWN", GF_CBK_CHILD_DOWN,
-                           client_cbk_child_down},
-    [GF_CBK_RECALL_LEASE] = {"RECALL_LEASE", GF_CBK_RECALL_LEASE,
-                             client_cbk_recall_lease},
+                                   client_cbk_cache_invalidation,
+                                   GF_CBK_CACHE_INVALIDATION},
+    [GF_CBK_CHILD_UP] = {"CHILD_UP", client_cbk_child_up, GF_CBK_CHILD_UP},
+    [GF_CBK_CHILD_DOWN] = {"CHILD_DOWN", client_cbk_child_down,
+                           GF_CBK_CHILD_DOWN},
+    [GF_CBK_RECALL_LEASE] = {"RECALL_LEASE", client_cbk_recall_lease,
+                             GF_CBK_RECALL_LEASE},
     [GF_CBK_INODELK_CONTENTION] = {"INODELK_CONTENTION",
-                                   GF_CBK_INODELK_CONTENTION,
-                                   client_cbk_inodelk_contention},
+                                   client_cbk_inodelk_contention,
+                                   GF_CBK_INODELK_CONTENTION},
     [GF_CBK_ENTRYLK_CONTENTION] = {"ENTRYLK_CONTENTION",
-                                   GF_CBK_ENTRYLK_CONTENTION,
-                                   client_cbk_entrylk_contention},
+                                   client_cbk_entrylk_contention,
+                                   GF_CBK_ENTRYLK_CONTENTION},
 };
 
 struct rpcclnt_cb_program gluster_cbk_prog = {

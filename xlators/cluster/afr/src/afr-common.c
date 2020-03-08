@@ -45,6 +45,21 @@ afr_quorum_errno(afr_private_t *priv)
     return ENOTCONN;
 }
 
+static void
+afr_fill_success_replies(afr_local_t *local, afr_private_t *priv,
+                         unsigned char *replies)
+{
+    int i = 0;
+
+    for (i = 0; i < priv->child_count; i++) {
+        if (local->replies[i].valid && local->replies[i].op_ret == 0) {
+            replies[i] = 1;
+        } else {
+            replies[i] = 0;
+        }
+    }
+}
+
 int
 afr_fav_child_reset_sink_xattrs(void *opaque);
 
@@ -53,6 +68,581 @@ afr_fav_child_reset_sink_xattrs_cbk(int ret, call_frame_t *frame, void *opaque);
 
 static void
 afr_discover_done(call_frame_t *frame, xlator_t *this);
+
+int
+afr_dom_lock_acquire_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
+                         int op_ret, int op_errno, dict_t *xdata)
+{
+    afr_local_t *local = frame->local;
+    afr_private_t *priv = this->private;
+    int i = (long)cookie;
+
+    local->cont.lk.dom_lock_op_ret[i] = op_ret;
+    local->cont.lk.dom_lock_op_errno[i] = op_errno;
+    if (op_ret < 0) {
+        gf_msg(this->name, GF_LOG_ERROR, op_errno, AFR_MSG_LK_HEAL_DOM,
+               "%s: Failed to acquire %s on %s",
+               uuid_utoa(local->fd->inode->gfid), AFR_LK_HEAL_DOM,
+               priv->children[i]->name);
+    } else {
+        local->cont.lk.dom_locked_nodes[i] = 1;
+    }
+
+    syncbarrier_wake(&local->barrier);
+
+    return 0;
+}
+
+int
+afr_dom_lock_acquire(call_frame_t *frame)
+{
+    afr_local_t *local = NULL;
+    afr_private_t *priv = NULL;
+    struct gf_flock flock = {
+        0,
+    };
+    int i = 0;
+
+    priv = frame->this->private;
+    local = frame->local;
+    local->cont.lk.dom_locked_nodes = GF_CALLOC(
+        priv->child_count, sizeof(*local->cont.lk.locked_nodes),
+        gf_afr_mt_char);
+    if (!local->cont.lk.dom_locked_nodes) {
+        return -ENOMEM;
+    }
+    local->cont.lk.dom_lock_op_ret = GF_CALLOC(
+        priv->child_count, sizeof(*local->cont.lk.dom_lock_op_ret),
+        gf_afr_mt_int32_t);
+    if (!local->cont.lk.dom_lock_op_ret) {
+        return -ENOMEM; /* CALLOC'd members are freed in afr_local_cleanup. */
+    }
+    local->cont.lk.dom_lock_op_errno = GF_CALLOC(
+        priv->child_count, sizeof(*local->cont.lk.dom_lock_op_errno),
+        gf_afr_mt_int32_t);
+    if (!local->cont.lk.dom_lock_op_errno) {
+        return -ENOMEM; /* CALLOC'd members are freed in afr_local_cleanup. */
+    }
+    flock.l_type = F_WRLCK;
+
+    AFR_ONALL(frame, afr_dom_lock_acquire_cbk, finodelk, AFR_LK_HEAL_DOM,
+              local->fd, F_SETLK, &flock, NULL);
+
+    if (!afr_has_quorum(local->cont.lk.dom_locked_nodes, frame->this, NULL))
+        goto blocking_lock;
+
+    /*If any of the bricks returned EAGAIN, we still need blocking locks.*/
+    if (AFR_COUNT(local->cont.lk.dom_locked_nodes, priv->child_count) !=
+        priv->child_count) {
+        for (i = 0; i < priv->child_count; i++) {
+            if (local->cont.lk.dom_lock_op_ret[i] == -1 &&
+                local->cont.lk.dom_lock_op_errno[i] == EAGAIN)
+                goto blocking_lock;
+        }
+    }
+
+    return 0;
+
+blocking_lock:
+    afr_dom_lock_release(frame);
+    AFR_ONALL(frame, afr_dom_lock_acquire_cbk, finodelk, AFR_LK_HEAL_DOM,
+              local->fd, F_SETLKW, &flock, NULL);
+    if (!afr_has_quorum(local->cont.lk.dom_locked_nodes, frame->this, NULL)) {
+        afr_dom_lock_release(frame);
+        return -afr_quorum_errno(priv);
+    }
+
+    return 0;
+}
+
+int
+afr_dom_lock_release_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
+                         int op_ret, int op_errno, dict_t *xdata)
+{
+    afr_local_t *local = frame->local;
+    afr_private_t *priv = this->private;
+    int i = (long)cookie;
+
+    if (op_ret < 0) {
+        gf_msg(this->name, GF_LOG_ERROR, op_errno, AFR_MSG_LK_HEAL_DOM,
+               "%s: Failed to release %s on %s", local->loc.path,
+               AFR_LK_HEAL_DOM, priv->children[i]->name);
+    }
+    local->cont.lk.dom_locked_nodes[i] = 0;
+
+    syncbarrier_wake(&local->barrier);
+
+    return 0;
+}
+
+void
+afr_dom_lock_release(call_frame_t *frame)
+{
+    afr_local_t *local = NULL;
+    afr_private_t *priv = NULL;
+    unsigned char *locked_on = NULL;
+    struct gf_flock flock = {
+        0,
+    };
+
+    local = frame->local;
+    priv = frame->this->private;
+    locked_on = local->cont.lk.dom_locked_nodes;
+    if (AFR_COUNT(locked_on, priv->child_count) == 0)
+        return;
+    flock.l_type = F_UNLCK;
+
+    AFR_ONLIST(locked_on, frame, afr_dom_lock_release_cbk, finodelk,
+               AFR_LK_HEAL_DOM, local->fd, F_SETLK, &flock, NULL);
+
+    return;
+}
+
+static void
+afr_lk_heal_info_cleanup(afr_lk_heal_info_t *info)
+{
+    if (!info)
+        return;
+    if (info->xdata_req)
+        dict_unref(info->xdata_req);
+    if (info->fd)
+        fd_unref(info->fd);
+    GF_FREE(info->locked_nodes);
+    GF_FREE(info->child_up_event_gen);
+    GF_FREE(info->child_down_event_gen);
+    GF_FREE(info);
+}
+
+static int
+afr_add_lock_to_saved_locks(call_frame_t *frame, xlator_t *this)
+{
+    afr_private_t *priv = this->private;
+    afr_local_t *local = frame->local;
+    afr_lk_heal_info_t *info = NULL;
+    afr_fd_ctx_t *fd_ctx = NULL;
+    int ret = -ENOMEM;
+
+    info = GF_CALLOC(sizeof(*info), 1, gf_afr_mt_lk_heal_info_t);
+    if (!info) {
+        goto cleanup;
+    }
+    INIT_LIST_HEAD(&info->pos);
+    info->fd = fd_ref(local->fd);
+    info->cmd = local->cont.lk.cmd;
+    info->pid = frame->root->pid;
+    info->flock = local->cont.lk.user_flock;
+    info->xdata_req = dict_copy_with_ref(local->xdata_req, NULL);
+    if (!info->xdata_req) {
+        goto cleanup;
+    }
+    info->lk_owner = frame->root->lk_owner;
+    info->locked_nodes = GF_MALLOC(
+        sizeof(*info->locked_nodes) * priv->child_count, gf_afr_mt_char);
+    if (!info->locked_nodes) {
+        goto cleanup;
+    }
+    memcpy(info->locked_nodes, local->cont.lk.locked_nodes,
+           sizeof(*info->locked_nodes) * priv->child_count);
+    info->child_up_event_gen = GF_CALLOC(sizeof(*info->child_up_event_gen),
+                                         priv->child_count, gf_afr_mt_int32_t);
+    if (!info->child_up_event_gen) {
+        goto cleanup;
+    }
+    info->child_down_event_gen = GF_CALLOC(sizeof(*info->child_down_event_gen),
+                                           priv->child_count,
+                                           gf_afr_mt_int32_t);
+    if (!info->child_down_event_gen) {
+        goto cleanup;
+    }
+
+    LOCK(&local->fd->lock);
+    {
+        fd_ctx = __afr_fd_ctx_get(local->fd, this);
+        if (fd_ctx)
+            fd_ctx->lk_heal_info = info;
+    }
+    UNLOCK(&local->fd->lock);
+    if (!fd_ctx) {
+        goto cleanup;
+    }
+
+    LOCK(&priv->lock);
+    {
+        list_add_tail(&info->pos, &priv->saved_locks);
+    }
+    UNLOCK(&priv->lock);
+
+    return 0;
+cleanup:
+    gf_msg(this->name, GF_LOG_ERROR, -ret, AFR_MSG_LK_HEAL_DOM,
+           "%s: Failed to add lock to healq",
+           uuid_utoa(local->fd->inode->gfid));
+    if (info) {
+        afr_lk_heal_info_cleanup(info);
+        if (fd_ctx) {
+            LOCK(&local->fd->lock);
+            {
+                fd_ctx->lk_heal_info = NULL;
+            }
+            UNLOCK(&local->fd->lock);
+        }
+    }
+    return ret;
+}
+
+static int
+afr_remove_lock_from_saved_locks(afr_local_t *local, xlator_t *this)
+{
+    afr_private_t *priv = this->private;
+    struct gf_flock flock = local->cont.lk.user_flock;
+    afr_lk_heal_info_t *info = NULL;
+    afr_fd_ctx_t *fd_ctx = NULL;
+    int ret = -EINVAL;
+
+    fd_ctx = afr_fd_ctx_get(local->fd, this);
+    if (!fd_ctx || !fd_ctx->lk_heal_info) {
+        goto out;
+    }
+
+    info = fd_ctx->lk_heal_info;
+    if ((info->flock.l_start != flock.l_start) ||
+        (info->flock.l_whence != flock.l_whence) ||
+        (info->flock.l_len != flock.l_len)) {
+        /*TODO: Compare lkowners too.*/
+        goto out;
+    }
+
+    LOCK(&priv->lock);
+    {
+        list_del(&fd_ctx->lk_heal_info->pos);
+    }
+    UNLOCK(&priv->lock);
+
+    afr_lk_heal_info_cleanup(info);
+    fd_ctx->lk_heal_info = NULL;
+    ret = 0;
+out:
+    if (ret)
+        gf_msg(this->name, GF_LOG_ERROR, -ret, AFR_MSG_LK_HEAL_DOM,
+               "%s: Failed to remove lock from healq",
+               uuid_utoa(local->fd->inode->gfid));
+    return ret;
+}
+
+int
+afr_lock_heal_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
+                  int32_t op_ret, int32_t op_errno, struct gf_flock *lock,
+                  dict_t *xdata)
+{
+    afr_local_t *local = frame->local;
+    int i = (long)cookie;
+
+    local->replies[i].valid = 1;
+    local->replies[i].op_ret = op_ret;
+    local->replies[i].op_errno = op_errno;
+    if (op_ret != 0) {
+        gf_msg(this->name, GF_LOG_ERROR, op_errno, AFR_MSG_LK_HEAL_DOM,
+               "Failed to heal lock on child %d for %s", i,
+               uuid_utoa(local->fd->inode->gfid));
+    }
+    syncbarrier_wake(&local->barrier);
+    return 0;
+}
+
+int
+afr_getlk_cbk(call_frame_t *frame, void *cookie, xlator_t *this, int32_t op_ret,
+              int32_t op_errno, struct gf_flock *lock, dict_t *xdata)
+{
+    afr_local_t *local = frame->local;
+    int i = (long)cookie;
+
+    local->replies[i].valid = 1;
+    local->replies[i].op_ret = op_ret;
+    local->replies[i].op_errno = op_errno;
+    if (op_ret != 0) {
+        gf_msg(this->name, GF_LOG_ERROR, op_errno, AFR_MSG_LK_HEAL_DOM,
+               "Failed getlk for %s", uuid_utoa(local->fd->inode->gfid));
+    } else {
+        local->cont.lk.getlk_rsp[i] = *lock;
+    }
+
+    syncbarrier_wake(&local->barrier);
+    return 0;
+}
+
+static gf_boolean_t
+afr_does_lk_owner_match(call_frame_t *frame, afr_private_t *priv,
+                        afr_lk_heal_info_t *info)
+{
+    int i = 0;
+    afr_local_t *local = frame->local;
+    struct gf_flock flock = {
+        0,
+    };
+    gf_boolean_t ret = _gf_true;
+    char *wind_on = alloca0(priv->child_count);
+    unsigned char *success_replies = alloca0(priv->child_count);
+    local->cont.lk.getlk_rsp = GF_CALLOC(sizeof(*local->cont.lk.getlk_rsp),
+                                         priv->child_count, gf_afr_mt_gf_lock);
+
+    flock = info->flock;
+    for (i = 0; i < priv->child_count; i++) {
+        if (info->locked_nodes[i])
+            wind_on[i] = 1;
+    }
+
+    AFR_ONLIST(wind_on, frame, afr_getlk_cbk, lk, info->fd, F_GETLK, &flock,
+               info->xdata_req);
+
+    afr_fill_success_replies(local, priv, success_replies);
+    if (AFR_COUNT(success_replies, priv->child_count) == 0) {
+        ret = _gf_false;
+        goto out;
+    }
+
+    for (i = 0; i < priv->child_count; i++) {
+        if (!local->replies[i].valid || local->replies[i].op_ret != 0)
+            continue;
+        if (local->cont.lk.getlk_rsp[i].l_type == F_UNLCK)
+            continue;
+        /*TODO: Do we really need to compare lkowner if F_UNLCK is true?*/
+        if (!is_same_lkowner(&local->cont.lk.getlk_rsp[i].l_owner,
+                             &info->lk_owner)) {
+            ret = _gf_false;
+            break;
+        }
+    }
+out:
+    afr_local_replies_wipe(local, priv);
+    GF_FREE(local->cont.lk.getlk_rsp);
+    local->cont.lk.getlk_rsp = NULL;
+    return ret;
+}
+
+static void
+afr_mark_fd_bad(fd_t *fd, xlator_t *this)
+{
+    afr_fd_ctx_t *fd_ctx = NULL;
+
+    if (!fd)
+        return;
+    LOCK(&fd->lock);
+    {
+        fd_ctx = __afr_fd_ctx_get(fd, this);
+        if (fd_ctx) {
+            fd_ctx->is_fd_bad = _gf_true;
+            fd_ctx->lk_heal_info = NULL;
+        }
+    }
+    UNLOCK(&fd->lock);
+}
+
+static void
+afr_add_lock_to_lkhealq(afr_private_t *priv, afr_lk_heal_info_t *info)
+{
+    LOCK(&priv->lock);
+    {
+        list_del(&info->pos);
+        list_add_tail(&info->pos, &priv->lk_healq);
+    }
+    UNLOCK(&priv->lock);
+}
+
+static void
+afr_lock_heal_do(call_frame_t *frame, afr_private_t *priv,
+                 afr_lk_heal_info_t *info)
+{
+    int i = 0;
+    int op_errno = 0;
+    int32_t *current_event_gen = NULL;
+    afr_local_t *local = frame->local;
+    xlator_t *this = frame->this;
+    char *wind_on = alloca0(priv->child_count);
+    gf_boolean_t retry = _gf_true;
+
+    frame->root->pid = info->pid;
+    lk_owner_copy(&frame->root->lk_owner, &info->lk_owner);
+
+    op_errno = -afr_dom_lock_acquire(frame);
+    if ((op_errno != 0)) {
+        goto release;
+    }
+
+    if (!afr_does_lk_owner_match(frame, priv, info)) {
+        gf_msg(this->name, GF_LOG_WARNING, 0, AFR_MSG_LK_HEAL_DOM,
+               "Ignoring lock heal for %s since lk-onwers mismatch. "
+               "Lock possibly pre-empted by another client.",
+               uuid_utoa(info->fd->inode->gfid));
+        goto release;
+    }
+
+    for (i = 0; i < priv->child_count; i++) {
+        if (info->locked_nodes[i])
+            continue;
+        wind_on[i] = 1;
+    }
+
+    current_event_gen = alloca(priv->child_count);
+    memcpy(current_event_gen, info->child_up_event_gen,
+           priv->child_count * sizeof *current_event_gen);
+    AFR_ONLIST(wind_on, frame, afr_lock_heal_cbk, lk, info->fd, info->cmd,
+               &info->flock, info->xdata_req);
+
+    LOCK(&priv->lock);
+    {
+        for (i = 0; i < priv->child_count; i++) {
+            if (!wind_on[i])
+                continue;
+            if ((!local->replies[i].valid) || (local->replies[i].op_ret != 0)) {
+                continue;
+            }
+
+            if ((current_event_gen[i] == info->child_up_event_gen[i]) &&
+                (current_event_gen[i] > info->child_down_event_gen[i])) {
+                info->locked_nodes[i] = 1;
+                retry = _gf_false;
+                list_del_init(&info->pos);
+                list_add_tail(&info->pos, &priv->saved_locks);
+            } else {
+                /*We received subsequent child up/down events while heal was in
+                 * progress; don't mark child as healed. Attempt again on the
+                 * new child up*/
+                gf_msg(this->name, GF_LOG_ERROR, 0, AFR_MSG_LK_HEAL_DOM,
+                       "Event gen mismatch: skipped healing lock on child %d "
+                       "for %s.",
+                       i, uuid_utoa(info->fd->inode->gfid));
+            }
+        }
+    }
+    UNLOCK(&priv->lock);
+
+release:
+    afr_dom_lock_release(frame);
+    if (retry)
+        afr_add_lock_to_lkhealq(priv, info);
+    return;
+}
+
+static int
+afr_lock_heal_done(int ret, call_frame_t *frame, void *opaque)
+{
+    STACK_DESTROY(frame->root);
+    return 0;
+}
+
+static int
+afr_lock_heal(void *opaque)
+{
+    call_frame_t *frame = (call_frame_t *)opaque;
+    call_frame_t *iter_frame = NULL;
+    xlator_t *this = frame->this;
+    afr_private_t *priv = this->private;
+    afr_lk_heal_info_t *info = NULL;
+    afr_lk_heal_info_t *tmp = NULL;
+    struct list_head healq = {
+        0,
+    };
+    int ret = 0;
+
+    iter_frame = afr_copy_frame(frame);
+    if (!iter_frame) {
+        return ENOMEM;
+    }
+
+    INIT_LIST_HEAD(&healq);
+    LOCK(&priv->lock);
+    {
+        list_splice_init(&priv->lk_healq, &healq);
+    }
+    UNLOCK(&priv->lock);
+
+    list_for_each_entry_safe(info, tmp, &healq, pos)
+    {
+        GF_ASSERT((AFR_COUNT(info->locked_nodes, priv->child_count) <
+                   priv->child_count));
+        ((afr_local_t *)(iter_frame->local))->fd = fd_ref(info->fd);
+        afr_lock_heal_do(iter_frame, priv, info);
+        AFR_STACK_RESET(iter_frame);
+        if (iter_frame->local == NULL) {
+            ret = ENOTCONN;
+            gf_msg(frame->this->name, GF_LOG_ERROR, ENOTCONN,
+                   AFR_MSG_LK_HEAL_DOM,
+                   "Aborting processing of lk_healq."
+                   "Healing will be reattempted on next child up for locks "
+                   "that are still in quorum.");
+            LOCK(&priv->lock);
+            {
+                list_add_tail(&healq, &priv->lk_healq);
+            }
+            UNLOCK(&priv->lock);
+            break;
+        }
+    }
+
+    AFR_STACK_DESTROY(iter_frame);
+    return ret;
+}
+
+static int
+__afr_lock_heal_synctask(xlator_t *this, afr_private_t *priv, int child)
+{
+    int ret = 0;
+    call_frame_t *frame = NULL;
+    afr_lk_heal_info_t *info = NULL;
+    afr_lk_heal_info_t *tmp = NULL;
+
+    if (priv->shd.iamshd)
+        return 0;
+
+    list_for_each_entry_safe(info, tmp, &priv->saved_locks, pos)
+    {
+        info->child_up_event_gen[child] = priv->event_generation;
+        list_del_init(&info->pos);
+        list_add_tail(&info->pos, &priv->lk_healq);
+    }
+
+    frame = create_frame(this, this->ctx->pool);
+    if (!frame)
+        return -1;
+
+    ret = synctask_new(this->ctx->env, afr_lock_heal, afr_lock_heal_done, frame,
+                       frame);
+    if (ret)
+        gf_msg(this->name, GF_LOG_ERROR, ENOMEM, AFR_MSG_LK_HEAL_DOM,
+               "Failed to launch lock heal synctask");
+
+    return ret;
+}
+
+static int
+__afr_mark_pending_lk_heal(xlator_t *this, afr_private_t *priv, int child)
+{
+    afr_lk_heal_info_t *info = NULL;
+    afr_lk_heal_info_t *tmp = NULL;
+
+    if (priv->shd.iamshd)
+        return 0;
+    list_for_each_entry_safe(info, tmp, &priv->saved_locks, pos)
+    {
+        info->child_down_event_gen[child] = priv->event_generation;
+        if (info->locked_nodes[child] == 1)
+            info->locked_nodes[child] = 0;
+        if (!afr_has_quorum(info->locked_nodes, this, NULL)) {
+            /* Since the lock was lost on quorum no. of nodes, we should
+             * not attempt to heal it anymore. Some other client could have
+             * acquired the lock, modified data and released it and this
+             * client wouldn't know about it if we heal it.*/
+            afr_mark_fd_bad(info->fd, this);
+            list_del(&info->pos);
+            afr_lk_heal_info_cleanup(info);
+            /* We're not winding an unlock on the node where the lock is still
+             * present because when fencing logic switches over to the new
+             * client (since we marked the fd bad), it should preempt any
+             * existing lock. */
+        }
+    }
+    return 0;
+}
 
 gf_boolean_t
 afr_is_consistent_io_possible(afr_local_t *local, afr_private_t *priv,
@@ -66,6 +656,19 @@ afr_is_consistent_io_possible(afr_local_t *local, afr_private_t *priv,
         return _gf_false;
     }
     return _gf_true;
+}
+
+gf_boolean_t
+afr_is_lock_mode_mandatory(dict_t *xdata)
+{
+    int ret = 0;
+    uint32_t lk_mode = GF_LK_ADVISORY;
+
+    ret = dict_get_uint32(xdata, GF_LOCK_MODE, &lk_mode);
+    if (!ret && lk_mode == GF_LK_MANDATORY)
+        return _gf_true;
+
+    return _gf_false;
 }
 
 call_frame_t *
@@ -1049,6 +1652,8 @@ afr_readables_fill(call_frame_t *frame, xlator_t *this, inode_t *inode,
             ia_type = inode->ia_type;
         }
 
+        if (!xdata)
+            continue; /* mkdir_cbk sends NULL xdata_rsp. */
         afr_accused_fill(this, xdata, data_accused,
                          (ia_type == IA_IFDIR) ? AFR_ENTRY_TRANSACTION
                                                : AFR_DATA_TRANSACTION);
@@ -1222,18 +1827,6 @@ refresh_done:
     local->refreshfn(frame, this, err);
 
     return 0;
-}
-
-static void
-afr_fill_success_replies(afr_local_t *local, afr_private_t *priv,
-                         unsigned char *replies)
-{
-    int i = 0;
-
-    for (i = 0; i < priv->child_count; i++) {
-        if (local->replies[i].valid && local->replies[i].op_ret == 0)
-            replies[i] = 1;
-    }
 }
 
 int
@@ -2049,6 +2642,9 @@ afr_local_cleanup(afr_local_t *local, xlator_t *this)
 
     { /* lk */
         GF_FREE(local->cont.lk.locked_nodes);
+        GF_FREE(local->cont.lk.dom_locked_nodes);
+        GF_FREE(local->cont.lk.dom_lock_op_ret);
+        GF_FREE(local->cont.lk.dom_lock_op_errno);
     }
 
     { /* create */
@@ -2293,7 +2889,8 @@ afr_attempt_readsubvol_set(call_frame_t *frame, xlator_t *this,
     if ((spb_choice >= 0) &&
         (AFR_COUNT(success_replies, child_count) == child_count)) {
         *read_subvol = spb_choice;
-    } else if (!priv->quorum_count) {
+    } else if (!priv->quorum_count ||
+               frame->root->pid == GF_CLIENT_PID_GLFS_HEAL) {
         *read_subvol = afr_first_up_child(frame, this);
     } else if (priv->quorum_count &&
                afr_has_quorum(data_readable, this, NULL)) {
@@ -3273,10 +3870,15 @@ afr_discover(call_frame_t *frame, xlator_t *this, loc_t *loc, dict_t *xattr_req)
 
     local->inode = inode_ref(loc->inode);
 
-    if (xattr_req)
+    if (xattr_req) {
         /* If xattr_req was null, afr_lookup_xattr_req_prepare() will
            allocate one for us */
-        local->xattr_req = dict_ref(xattr_req);
+        local->xattr_req = dict_copy_with_ref(xattr_req, NULL);
+        if (!local->xattr_req) {
+            op_errno = ENOMEM;
+            goto out;
+        }
+    }
 
     if (gf_uuid_is_null(loc->inode->gfid)) {
         afr_discover_do(frame, this, 0);
@@ -3445,8 +4047,18 @@ out:
 }
 
 void
-_afr_cleanup_fd_ctx(afr_fd_ctx_t *fd_ctx)
+_afr_cleanup_fd_ctx(xlator_t *this, afr_fd_ctx_t *fd_ctx)
 {
+    afr_private_t *priv = this->private;
+
+    if (fd_ctx->lk_heal_info) {
+        LOCK(&priv->lock);
+        {
+            list_del(&fd_ctx->lk_heal_info->pos);
+        }
+        afr_lk_heal_info_cleanup(fd_ctx->lk_heal_info);
+        fd_ctx->lk_heal_info = NULL;
+    }
     GF_FREE(fd_ctx->opened_on);
     GF_FREE(fd_ctx);
     return;
@@ -3466,7 +4078,7 @@ afr_cleanup_fd_ctx(xlator_t *this, fd_t *fd)
     fd_ctx = (afr_fd_ctx_t *)(long)ctx;
 
     if (fd_ctx) {
-        _afr_cleanup_fd_ctx(fd_ctx);
+        _afr_cleanup_fd_ctx(this, fd_ctx);
     }
 
 out:
@@ -3559,13 +4171,14 @@ __afr_fd_ctx_set(xlator_t *this, fd_t *fd)
     }
 
     fd_ctx->readdir_subvol = -1;
+    fd_ctx->lk_heal_info = NULL;
 
     ret = __fd_ctx_set(fd, this, (uint64_t)(long)fd_ctx);
     if (ret)
         gf_msg_debug(this->name, 0, "failed to set fd ctx (%p)", fd);
 out:
     if (ret && fd_ctx)
-        _afr_cleanup_fd_ctx(fd_ctx);
+        _afr_cleanup_fd_ctx(this, fd_ctx);
     return ret;
 }
 
@@ -3589,10 +4202,9 @@ afr_flush_cbk(call_frame_t *frame, void *cookie, xlator_t *this, int32_t op_ret,
         } else {
             local->op_errno = op_errno;
         }
+        call_count = --local->call_count;
     }
     UNLOCK(&frame->lock);
-
-    call_count = afr_frame_return(frame);
 
     if (call_count == 0)
         AFR_STACK_UNWIND(flush, frame, local->op_ret, local->op_errno,
@@ -3689,6 +4301,7 @@ afr_flush(call_frame_t *frame, xlator_t *this, fd_t *fd, dict_t *xdata)
     call_stub_t *stub = NULL;
     int op_errno = ENOMEM;
 
+    AFR_ERROR_OUT_IF_FDCTX_INVALID(fd, this, op_errno, out);
     local = AFR_FRAME_INIT(frame, op_errno);
     if (!local)
         goto out;
@@ -3729,10 +4342,9 @@ afr_fsyncdir_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
         } else {
             local->op_errno = op_errno;
         }
+        call_count = --local->call_count;
     }
     UNLOCK(&frame->lock);
-
-    call_count = afr_frame_return(frame);
 
     if (call_count == 0)
         AFR_STACK_UNWIND(fsyncdir, frame, local->op_ret, local->op_errno,
@@ -4226,9 +4838,9 @@ out:
 }
 
 static int32_t
-afr_handle_inodelk(call_frame_t *frame, glusterfs_fop_t fop, const char *volume,
-                   loc_t *loc, fd_t *fd, int32_t cmd, struct gf_flock *flock,
-                   dict_t *xdata)
+afr_handle_inodelk(call_frame_t *frame, xlator_t *this, glusterfs_fop_t fop,
+                   const char *volume, loc_t *loc, fd_t *fd, int32_t cmd,
+                   struct gf_flock *flock, dict_t *xdata)
 {
     afr_local_t *local = NULL;
     int32_t op_errno = ENOMEM;
@@ -4240,8 +4852,10 @@ afr_handle_inodelk(call_frame_t *frame, glusterfs_fop_t fop, const char *volume,
     local->op = fop;
     if (loc)
         loc_copy(&local->loc, loc);
-    if (fd)
+    if (fd && (flock->l_type != F_UNLCK)) {
+        AFR_ERROR_OUT_IF_FDCTX_INVALID(fd, this, op_errno, out);
         local->fd = fd_ref(fd);
+    }
 
     local->cont.inodelk.volume = gf_strdup(volume);
     if (!local->cont.inodelk.volume) {
@@ -4270,8 +4884,8 @@ int32_t
 afr_inodelk(call_frame_t *frame, xlator_t *this, const char *volume, loc_t *loc,
             int32_t cmd, struct gf_flock *flock, dict_t *xdata)
 {
-    afr_handle_inodelk(frame, GF_FOP_INODELK, volume, loc, NULL, cmd, flock,
-                       xdata);
+    afr_handle_inodelk(frame, this, GF_FOP_INODELK, volume, loc, NULL, cmd,
+                       flock, xdata);
     return 0;
 }
 
@@ -4279,15 +4893,16 @@ int32_t
 afr_finodelk(call_frame_t *frame, xlator_t *this, const char *volume, fd_t *fd,
              int32_t cmd, struct gf_flock *flock, dict_t *xdata)
 {
-    afr_handle_inodelk(frame, GF_FOP_FINODELK, volume, NULL, fd, cmd, flock,
-                       xdata);
+    afr_handle_inodelk(frame, this, GF_FOP_FINODELK, volume, NULL, fd, cmd,
+                       flock, xdata);
     return 0;
 }
 
 static int
-afr_handle_entrylk(call_frame_t *frame, glusterfs_fop_t fop, const char *volume,
-                   loc_t *loc, fd_t *fd, const char *basename, entrylk_cmd cmd,
-                   entrylk_type type, dict_t *xdata)
+afr_handle_entrylk(call_frame_t *frame, xlator_t *this, glusterfs_fop_t fop,
+                   const char *volume, loc_t *loc, fd_t *fd,
+                   const char *basename, entrylk_cmd cmd, entrylk_type type,
+                   dict_t *xdata)
 {
     afr_local_t *local = NULL;
     int32_t op_errno = ENOMEM;
@@ -4299,8 +4914,10 @@ afr_handle_entrylk(call_frame_t *frame, glusterfs_fop_t fop, const char *volume,
     local->op = fop;
     if (loc)
         loc_copy(&local->loc, loc);
-    if (fd)
+    if (fd && (cmd != ENTRYLK_UNLOCK)) {
+        AFR_ERROR_OUT_IF_FDCTX_INVALID(fd, this, op_errno, out);
         local->fd = fd_ref(fd);
+    }
     local->cont.entrylk.cmd = cmd;
     local->cont.entrylk.in_cmd = cmd;
     local->cont.entrylk.type = type;
@@ -4327,8 +4944,8 @@ afr_entrylk(call_frame_t *frame, xlator_t *this, const char *volume, loc_t *loc,
             const char *basename, entrylk_cmd cmd, entrylk_type type,
             dict_t *xdata)
 {
-    afr_handle_entrylk(frame, GF_FOP_ENTRYLK, volume, loc, NULL, basename, cmd,
-                       type, xdata);
+    afr_handle_entrylk(frame, this, GF_FOP_ENTRYLK, volume, loc, NULL, basename,
+                       cmd, type, xdata);
     return 0;
 }
 
@@ -4337,8 +4954,8 @@ afr_fentrylk(call_frame_t *frame, xlator_t *this, const char *volume, fd_t *fd,
              const char *basename, entrylk_cmd cmd, entrylk_type type,
              dict_t *xdata)
 {
-    afr_handle_entrylk(frame, GF_FOP_FENTRYLK, volume, NULL, fd, basename, cmd,
-                       type, xdata);
+    afr_handle_entrylk(frame, this, GF_FOP_FENTRYLK, volume, NULL, fd, basename,
+                       cmd, type, xdata);
     return 0;
 }
 
@@ -4350,10 +4967,10 @@ afr_statfs_cbk(call_frame_t *frame, void *cookie, xlator_t *this, int op_ret,
     int call_count = 0;
     struct statvfs *buf = NULL;
 
+    local = frame->local;
+
     LOCK(&frame->lock);
     {
-        local = frame->local;
-
         if (op_ret != 0) {
             local->op_errno = op_errno;
             goto unlock;
@@ -4379,9 +4996,8 @@ afr_statfs_cbk(call_frame_t *frame, void *cookie, xlator_t *this, int op_ret,
         }
     }
 unlock:
+    call_count = --local->call_count;
     UNLOCK(&frame->lock);
-
-    call_count = afr_frame_return(frame);
 
     if (call_count == 0)
         AFR_STACK_UNWIND(statfs, frame, local->op_ret, local->op_errno,
@@ -4457,9 +5073,10 @@ afr_lk_unlock_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
     }
 
     call_count = afr_frame_return(frame);
-    if (call_count == 0)
+    if (call_count == 0) {
         AFR_STACK_UNWIND(lk, frame, local->op_ret, local->op_errno, NULL,
                          local->xdata_rsp);
+    }
 
     return 0;
 }
@@ -4558,11 +5175,133 @@ afr_lk_cbk(call_frame_t *frame, void *cookie, xlator_t *this, int32_t op_ret,
 }
 
 int
+afr_lk_transaction_cbk(int ret, call_frame_t *frame, void *opaque)
+{
+    return 0;
+}
+
+int
+afr_lk_txn_wind_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
+                    int32_t op_ret, int32_t op_errno, struct gf_flock *lock,
+                    dict_t *xdata)
+{
+    afr_local_t *local = NULL;
+    int child_index = -1;
+
+    local = frame->local;
+    child_index = (long)cookie;
+    afr_common_lock_cbk(frame, cookie, this, op_ret, op_errno, xdata);
+    if (op_ret == 0) {
+        local->op_ret = 0;
+        local->op_errno = 0;
+        local->cont.lk.locked_nodes[child_index] = 1;
+        local->cont.lk.ret_flock = *lock;
+    }
+    syncbarrier_wake(&local->barrier);
+    return 0;
+}
+
+int
+afr_lk_txn_unlock_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
+                      int32_t op_ret, int32_t op_errno, struct gf_flock *lock,
+                      dict_t *xdata)
+{
+    afr_local_t *local = frame->local;
+    afr_private_t *priv = this->private;
+    int child_index = (long)cookie;
+
+    if (op_ret < 0 && op_errno != ENOTCONN && op_errno != EBADFD) {
+        gf_msg(this->name, GF_LOG_ERROR, op_errno, AFR_MSG_UNLOCK_FAIL,
+               "gfid=%s: unlock failed on subvolume %s "
+               "with lock owner %s",
+               uuid_utoa(local->fd->inode->gfid),
+               priv->children[child_index]->name,
+               lkowner_utoa(&frame->root->lk_owner));
+    }
+    return 0;
+}
+int
+afr_lk_transaction(void *opaque)
+{
+    call_frame_t *frame = NULL;
+    xlator_t *this = NULL;
+    afr_private_t *priv = NULL;
+    afr_local_t *local = NULL;
+    char *wind_on = NULL;
+    int op_errno = 0;
+    int i = 0;
+    int ret = 0;
+
+    frame = (call_frame_t *)opaque;
+    local = frame->local;
+    this = frame->this;
+    priv = this->private;
+    wind_on = alloca0(priv->child_count);
+
+    if (priv->arbiter_count || priv->child_count != 3) {
+        op_errno = ENOTSUP;
+        gf_msg(frame->this->name, GF_LOG_ERROR, op_errno, AFR_MSG_LK_HEAL_DOM,
+               "%s: Lock healing supported only for replica 3 volumes.",
+               uuid_utoa(local->fd->inode->gfid));
+        goto err;
+    }
+
+    op_errno = -afr_dom_lock_acquire(frame);  // Released during
+                                              // AFR_STACK_UNWIND
+    if (op_errno != 0) {
+        goto err;
+    }
+    if (priv->quorum_count &&
+        !afr_has_quorum(local->cont.lk.dom_locked_nodes, this, NULL)) {
+        op_errno = afr_final_errno(local, priv);
+        goto err;
+    }
+
+    for (i = 0; i < priv->child_count; i++) {
+        if (priv->child_up[i] && local->cont.lk.dom_locked_nodes[i])
+            wind_on[i] = 1;
+    }
+    AFR_ONLIST(wind_on, frame, afr_lk_txn_wind_cbk, lk, local->fd,
+               local->cont.lk.cmd, &local->cont.lk.user_flock,
+               local->xdata_req);
+
+    if (priv->quorum_count &&
+        !afr_has_quorum(local->cont.lk.locked_nodes, this, NULL)) {
+        local->op_ret = -1;
+        local->op_errno = afr_final_errno(local, priv);
+        goto unlock;
+    } else {
+        if (local->cont.lk.user_flock.l_type == F_UNLCK)
+            ret = afr_remove_lock_from_saved_locks(local, this);
+        else
+            ret = afr_add_lock_to_saved_locks(frame, this);
+        if (ret) {
+            local->op_ret = -1;
+            local->op_errno = -ret;
+            goto unlock;
+        }
+        AFR_STACK_UNWIND(lk, frame, local->op_ret, local->op_errno,
+                         &local->cont.lk.ret_flock, local->xdata_rsp);
+    }
+
+    return 0;
+
+unlock:
+    local->cont.lk.user_flock.l_type = F_UNLCK;
+    AFR_ONLIST(local->cont.lk.locked_nodes, frame, afr_lk_txn_unlock_cbk, lk,
+               local->fd, F_SETLK, &local->cont.lk.user_flock, NULL);
+err:
+    AFR_STACK_UNWIND(lk, frame, -1, op_errno, NULL, NULL);
+    return -1;
+}
+
+int
 afr_lk(call_frame_t *frame, xlator_t *this, fd_t *fd, int32_t cmd,
        struct gf_flock *flock, dict_t *xdata)
 {
     afr_private_t *priv = NULL;
     afr_local_t *local = NULL;
+    int ret = 0;
     int i = 0;
     int32_t op_errno = ENOMEM;
 
@@ -4573,9 +5312,11 @@ afr_lk(call_frame_t *frame, xlator_t *this, fd_t *fd, int32_t cmd,
         goto out;
 
     local->op = GF_FOP_LK;
-    if (!afr_lk_is_unlock(cmd, flock) &&
-        !afr_is_consistent_io_possible(local, priv, &op_errno))
-        goto out;
+    if (!afr_lk_is_unlock(cmd, flock)) {
+        AFR_ERROR_OUT_IF_FDCTX_INVALID(fd, this, op_errno, out);
+        if (!afr_is_consistent_io_possible(local, priv, &op_errno))
+            goto out;
+    }
 
     local->cont.lk.locked_nodes = GF_CALLOC(
         priv->child_count, sizeof(*local->cont.lk.locked_nodes),
@@ -4592,6 +5333,16 @@ afr_lk(call_frame_t *frame, xlator_t *this, fd_t *fd, int32_t cmd,
     local->cont.lk.ret_flock = *flock;
     if (xdata)
         local->xdata_req = dict_ref(xdata);
+
+    if (afr_is_lock_mode_mandatory(xdata)) {
+        ret = synctask_new(this->ctx->env, afr_lk_transaction,
+                           afr_lk_transaction_cbk, frame, frame);
+        if (ret) {
+            op_errno = ENOMEM;
+            goto out;
+        }
+        return 0;
+    }
 
     STACK_WIND_COOKIE(frame, afr_lk_cbk, (void *)(long)0, priv->children[i],
                       priv->children[i]->fops->lk, fd, cmd, flock,
@@ -4986,13 +5737,31 @@ __afr_get_up_children_count(afr_private_t *priv)
     return up_children;
 }
 
+static int
+__get_heard_from_all_status(xlator_t *this)
+{
+    afr_private_t *priv = this->private;
+    int i;
+
+    for (i = 0; i < priv->child_count; i++) {
+        if (!priv->last_event[i]) {
+            return 0;
+        }
+    }
+    if (priv->thin_arbiter_count && !priv->ta_child_up) {
+        return 0;
+    }
+    return 1;
+}
+
 glusterfs_event_t
-__afr_transform_event_from_state(afr_private_t *priv)
+__afr_transform_event_from_state(xlator_t *this)
 {
     int i = 0;
     int up_children = 0;
+    afr_private_t *priv = this->private;
 
-    if (AFR_COUNT(priv->last_event, priv->child_count) == priv->child_count)
+    if (__get_heard_from_all_status(this))
         /* have_heard_from_all. Let afr_notify() do the propagation. */
         return GF_EVENT_MAXVAL;
 
@@ -5034,7 +5803,7 @@ afr_notify_cbk(void *data)
             goto unlock;
         }
         priv->timer = NULL;
-        event = __afr_transform_event_from_state(priv);
+        event = __afr_transform_event_from_state(this);
         if (event != GF_EVENT_MAXVAL)
             propagate = _gf_true;
     }
@@ -5059,20 +5828,6 @@ __afr_launch_notify_timer(xlator_t *this, afr_private_t *priv)
         gf_msg(this->name, GF_LOG_ERROR, 0, AFR_MSG_TIMER_CREATE_FAIL,
                "Cannot create timer for delayed initialization");
     }
-}
-
-static int
-__get_heard_from_all_status(xlator_t *this)
-{
-    afr_private_t *priv = this->private;
-    int i;
-
-    for (i = 0; i < priv->child_count; i++) {
-        if (!priv->last_event[i]) {
-            return 0;
-        }
-    }
-    return 1;
 }
 
 static int
@@ -5590,6 +6345,7 @@ afr_notify(xlator_t *this, int32_t event, void *data, void *data2)
                 __afr_handle_child_up_event(this, child_xlator, idx,
                                             child_latency_msec, &event,
                                             &call_psh, &up_child);
+                __afr_lock_heal_synctask(this, priv, idx);
                 break;
 
             case GF_EVENT_CHILD_DOWN:
@@ -5603,6 +6359,7 @@ afr_notify(xlator_t *this, int32_t event, void *data, void *data2)
                 __afr_handle_child_down_event(this, child_xlator, idx,
                                               child_latency_msec, &event,
                                               &call_psh, &up_child);
+                __afr_mark_pending_lk_heal(this, priv, idx);
                 break;
 
             case GF_EVENT_CHILD_CONNECTING:
@@ -5954,243 +6711,6 @@ out:
     return changelog;
 }
 
-gf_boolean_t
-afr_decide_heal_info(afr_private_t *priv, unsigned char *sources, int source)
-{
-    int sources_count = 0;
-
-    if (source < 0)
-        goto out;
-
-    sources_count = AFR_COUNT(sources, priv->child_count);
-    if (sources_count == priv->child_count)
-        return _gf_false;
-out:
-    return _gf_true;
-}
-
-int
-afr_selfheal_locked_metadata_inspect(call_frame_t *frame, xlator_t *this,
-                                     inode_t *inode, gf_boolean_t *msh,
-                                     unsigned char *pending)
-{
-    int ret = -1;
-    unsigned char *locked_on = NULL;
-    unsigned char *sources = NULL;
-    unsigned char *sinks = NULL;
-    unsigned char *healed_sinks = NULL;
-    unsigned char *undid_pending = NULL;
-    struct afr_reply *locked_replies = NULL;
-
-    afr_private_t *priv = this->private;
-
-    locked_on = alloca0(priv->child_count);
-    sources = alloca0(priv->child_count);
-    sinks = alloca0(priv->child_count);
-    healed_sinks = alloca0(priv->child_count);
-    undid_pending = alloca0(priv->child_count);
-
-    locked_replies = alloca0(sizeof(*locked_replies) * priv->child_count);
-
-    ret = afr_selfheal_inodelk(frame, this, inode, this->name, LLONG_MAX - 1, 0,
-                               locked_on);
-    {
-        if (ret == 0) {
-            /* Not a single lock */
-            ret = -afr_final_errno(frame->local, priv);
-            if (ret == 0)
-                ret = -ENOTCONN; /* all invalid responses */
-            goto out;
-        }
-        ret = __afr_selfheal_metadata_prepare(
-            frame, this, inode, locked_on, sources, sinks, healed_sinks,
-            undid_pending, locked_replies, pending);
-        *msh = afr_decide_heal_info(priv, sources, ret);
-    }
-    afr_selfheal_uninodelk(frame, this, inode, this->name, LLONG_MAX - 1, 0,
-                           locked_on);
-out:
-    if (locked_replies)
-        afr_replies_wipe(locked_replies, priv->child_count);
-    return ret;
-}
-
-int
-afr_selfheal_locked_data_inspect(call_frame_t *frame, xlator_t *this, fd_t *fd,
-                                 gf_boolean_t *dsh, unsigned char *pflag)
-{
-    int ret = -1;
-    unsigned char *data_lock = NULL;
-    unsigned char *sources = NULL;
-    unsigned char *sinks = NULL;
-    unsigned char *healed_sinks = NULL;
-    unsigned char *undid_pending = NULL;
-    afr_private_t *priv = NULL;
-    struct afr_reply *locked_replies = NULL;
-    inode_t *inode = fd->inode;
-
-    priv = this->private;
-    data_lock = alloca0(priv->child_count);
-    sources = alloca0(priv->child_count);
-    sinks = alloca0(priv->child_count);
-    healed_sinks = alloca0(priv->child_count);
-    undid_pending = alloca0(priv->child_count);
-
-    locked_replies = alloca0(sizeof(*locked_replies) * priv->child_count);
-
-    ret = afr_selfheal_inodelk(frame, this, inode, this->name, 0, 0, data_lock);
-    {
-        if (ret == 0) {
-            ret = -afr_final_errno(frame->local, priv);
-            if (ret == 0)
-                ret = -ENOTCONN; /* all invalid responses */
-            goto out;
-        }
-        ret = __afr_selfheal_data_prepare(frame, this, inode, data_lock,
-                                          sources, sinks, healed_sinks,
-                                          undid_pending, locked_replies, pflag);
-        *dsh = afr_decide_heal_info(priv, sources, ret);
-    }
-    afr_selfheal_uninodelk(frame, this, inode, this->name, 0, 0, data_lock);
-out:
-    if (locked_replies)
-        afr_replies_wipe(locked_replies, priv->child_count);
-    return ret;
-}
-
-int
-afr_selfheal_locked_entry_inspect(call_frame_t *frame, xlator_t *this,
-                                  inode_t *inode, gf_boolean_t *esh,
-                                  unsigned char *pflag)
-{
-    int ret = -1;
-    int source = -1;
-    afr_private_t *priv = NULL;
-    unsigned char *locked_on = NULL;
-    unsigned char *data_lock = NULL;
-    unsigned char *sources = NULL;
-    unsigned char *sinks = NULL;
-    unsigned char *healed_sinks = NULL;
-    struct afr_reply *locked_replies = NULL;
-    gf_boolean_t granular_locks = _gf_false;
-
-    priv = this->private;
-    granular_locks = priv->granular_locks; /*Assign to local variable so that
-                                             reconfigure doesn't change this
-                                             value between locking and unlocking
-                                             below*/
-    locked_on = alloca0(priv->child_count);
-    data_lock = alloca0(priv->child_count);
-    sources = alloca0(priv->child_count);
-    sinks = alloca0(priv->child_count);
-    healed_sinks = alloca0(priv->child_count);
-
-    locked_replies = alloca0(sizeof(*locked_replies) * priv->child_count);
-
-    if (!granular_locks) {
-        ret = afr_selfheal_tryentrylk(frame, this, inode, priv->sh_domain, NULL,
-                                      locked_on);
-    }
-    {
-        if (!granular_locks && ret == 0) {
-            ret = -afr_final_errno(frame->local, priv);
-            if (ret == 0)
-                ret = -ENOTCONN; /* all invalid responses */
-            goto out;
-        }
-
-        ret = afr_selfheal_entrylk(frame, this, inode, this->name, NULL,
-                                   data_lock);
-        {
-            if (ret == 0) {
-                ret = -afr_final_errno(frame->local, priv);
-                if (ret == 0)
-                    ret = -ENOTCONN;
-                /* all invalid responses */
-                goto unlock;
-            }
-            ret = __afr_selfheal_entry_prepare(frame, this, inode, data_lock,
-                                               sources, sinks, healed_sinks,
-                                               locked_replies, &source, pflag);
-            if ((ret == 0) && (*pflag & PFLAG_SBRAIN))
-                ret = -EIO;
-            *esh = afr_decide_heal_info(priv, sources, ret);
-        }
-        afr_selfheal_unentrylk(frame, this, inode, this->name, NULL, data_lock,
-                               NULL);
-    }
-unlock:
-    if (!granular_locks)
-        afr_selfheal_unentrylk(frame, this, inode, priv->sh_domain, NULL,
-                               locked_on, NULL);
-out:
-    if (locked_replies)
-        afr_replies_wipe(locked_replies, priv->child_count);
-    return ret;
-}
-
-int
-afr_selfheal_locked_inspect(call_frame_t *frame, xlator_t *this, uuid_t gfid,
-                            inode_t **inode, gf_boolean_t *entry_selfheal,
-                            gf_boolean_t *data_selfheal,
-                            gf_boolean_t *metadata_selfheal,
-                            unsigned char *pending)
-
-{
-    int ret = -1;
-    fd_t *fd = NULL;
-    gf_boolean_t dsh = _gf_false;
-    gf_boolean_t msh = _gf_false;
-    gf_boolean_t esh = _gf_false;
-
-    ret = afr_selfheal_unlocked_inspect(frame, this, gfid, inode, &dsh, &msh,
-                                        &esh);
-    if (ret)
-        goto out;
-
-    /* For every heal type hold locks and check if it indeed needs heal */
-
-    /* Heal-info does an open() on the file being examined so that the
-     * current eager-lock holding client, if present, at some point sees
-     * open-fd count being > 1 and releases the eager-lock so that heal-info
-     * doesn't remain blocked forever until IO completes.
-     */
-    if ((*inode)->ia_type == IA_IFREG) {
-        ret = afr_selfheal_data_open(this, *inode, &fd);
-        if (ret < 0) {
-            gf_msg_debug(this->name, -ret, "%s: Failed to open",
-                         uuid_utoa((*inode)->gfid));
-            goto out;
-        }
-    }
-
-    if (msh) {
-        ret = afr_selfheal_locked_metadata_inspect(frame, this, *inode, &msh,
-                                                   pending);
-        if (ret == -EIO)
-            goto out;
-    }
-
-    if (dsh) {
-        ret = afr_selfheal_locked_data_inspect(frame, this, fd, &dsh, pending);
-        if (ret == -EIO || (ret == -EAGAIN))
-            goto out;
-    }
-
-    if (esh) {
-        ret = afr_selfheal_locked_entry_inspect(frame, this, *inode, &esh,
-                                                pending);
-    }
-
-out:
-    *data_selfheal = dsh;
-    *entry_selfheal = esh;
-    *metadata_selfheal = msh;
-    if (fd)
-        fd_unref(fd);
-    return ret;
-}
-
 static dict_t *
 afr_set_heal_info(char *status)
 {
@@ -6222,6 +6742,187 @@ out:
     return dict;
 }
 
+static gf_boolean_t
+afr_is_dirty_count_non_unary_for_txn(xlator_t *this, struct afr_reply *replies,
+                                     afr_transaction_type type)
+{
+    afr_private_t *priv = this->private;
+    int *dirty = alloca0(priv->child_count * sizeof(int));
+    int i = 0;
+
+    afr_selfheal_extract_xattr(this, replies, type, dirty, NULL);
+    for (i = 0; i < priv->child_count; i++) {
+        if (dirty[i] > 1)
+            return _gf_true;
+    }
+
+    return _gf_false;
+}
+
+static gf_boolean_t
+afr_is_dirty_count_non_unary(xlator_t *this, struct afr_reply *replies,
+                             ia_type_t ia_type)
+{
+    gf_boolean_t data_chk = _gf_false;
+    gf_boolean_t mdata_chk = _gf_false;
+    gf_boolean_t entry_chk = _gf_false;
+
+    switch (ia_type) {
+        case IA_IFDIR:
+            mdata_chk = _gf_true;
+            entry_chk = _gf_true;
+            break;
+        case IA_IFREG:
+            mdata_chk = _gf_true;
+            data_chk = _gf_true;
+            break;
+        default:
+            /*IA_IFBLK, IA_IFCHR, IA_IFLNK, IA_IFIFO, IA_IFSOCK*/
+            mdata_chk = _gf_true;
+            break;
+    }
+
+    if (data_chk && afr_is_dirty_count_non_unary_for_txn(
+                        this, replies, AFR_DATA_TRANSACTION)) {
+        return _gf_true;
+    } else if (mdata_chk && afr_is_dirty_count_non_unary_for_txn(
+                                this, replies, AFR_METADATA_TRANSACTION)) {
+        return _gf_true;
+    } else if (entry_chk && afr_is_dirty_count_non_unary_for_txn(
+                                this, replies, AFR_ENTRY_TRANSACTION)) {
+        return _gf_true;
+    }
+
+    return _gf_false;
+}
+
+static int
+afr_update_heal_status(xlator_t *this, struct afr_reply *replies,
+                       ia_type_t ia_type, gf_boolean_t *esh, gf_boolean_t *dsh,
+                       gf_boolean_t *msh, unsigned char pending)
+{
+    int ret = -1;
+    GF_UNUSED int ret1 = 0;
+    int i = 0;
+    int io_domain_lk_count = 0;
+    int shd_domain_lk_count = 0;
+    afr_private_t *priv = NULL;
+    char *key1 = NULL;
+    char *key2 = NULL;
+
+    priv = this->private;
+    key1 = alloca0(strlen(GLUSTERFS_INODELK_DOM_PREFIX) + 2 +
+                   strlen(this->name));
+    key2 = alloca0(strlen(GLUSTERFS_INODELK_DOM_PREFIX) + 2 +
+                   strlen(priv->sh_domain));
+    sprintf(key1, "%s:%s", GLUSTERFS_INODELK_DOM_PREFIX, this->name);
+    sprintf(key2, "%s:%s", GLUSTERFS_INODELK_DOM_PREFIX, priv->sh_domain);
+
+    for (i = 0; i < priv->child_count; i++) {
+        if ((replies[i].valid != 1) || (replies[i].op_ret != 0))
+            continue;
+        if (!io_domain_lk_count) {
+            ret1 = dict_get_int32(replies[i].xdata, key1, &io_domain_lk_count);
+        }
+        if (!shd_domain_lk_count) {
+            ret1 = dict_get_int32(replies[i].xdata, key2, &shd_domain_lk_count);
+        }
+    }
+
+    if (!pending) {
+        if ((afr_is_dirty_count_non_unary(this, replies, ia_type)) ||
+            (!io_domain_lk_count)) {
+            /* Needs heal. */
+            ret = 0;
+        } else {
+            /* No heal needed. */
+            *dsh = *esh = *msh = 0;
+        }
+    } else {
+        if (shd_domain_lk_count) {
+            ret = -EAGAIN; /*For 'possibly-healing'. */
+        } else {
+            ret = 0; /*needs heal. Just set a non -ve value so that it is
+                       assumed as the source index.*/
+        }
+    }
+    return ret;
+}
+
+/*return EIO, EAGAIN or pending*/
+int
+afr_lockless_inspect(call_frame_t *frame, xlator_t *this, uuid_t gfid,
+                     inode_t **inode, gf_boolean_t *entry_selfheal,
+                     gf_boolean_t *data_selfheal,
+                     gf_boolean_t *metadata_selfheal, unsigned char *pending)
+{
+    int ret = -1;
+    int i = 0;
+    afr_private_t *priv = NULL;
+    struct afr_reply *replies = NULL;
+    gf_boolean_t dsh = _gf_false;
+    gf_boolean_t msh = _gf_false;
+    gf_boolean_t esh = _gf_false;
+    unsigned char *sources = NULL;
+    unsigned char *sinks = NULL;
+    unsigned char *valid_on = NULL;
+    uint64_t *witness = NULL;
+
+    priv = this->private;
+    replies = alloca0(sizeof(*replies) * priv->child_count);
+    sources = alloca0(sizeof(*sources) * priv->child_count);
+    sinks = alloca0(sizeof(*sinks) * priv->child_count);
+    witness = alloca0(sizeof(*witness) * priv->child_count);
+    valid_on = alloca0(sizeof(*valid_on) * priv->child_count);
+
+    ret = afr_selfheal_unlocked_inspect(frame, this, gfid, inode, &dsh, &msh,
+                                        &esh, replies);
+    if (ret)
+        goto out;
+    for (i = 0; i < priv->child_count; i++) {
+        if (replies[i].valid && replies[i].op_ret == 0) {
+            valid_on[i] = 1;
+        }
+    }
+    if (msh) {
+        ret = afr_selfheal_find_direction(frame, this, replies,
+                                          AFR_METADATA_TRANSACTION, valid_on,
+                                          sources, sinks, witness, pending);
+        if (*pending & PFLAG_SBRAIN)
+            ret = -EIO;
+        if (ret)
+            goto out;
+    }
+    if (dsh) {
+        ret = afr_selfheal_find_direction(frame, this, replies,
+                                          AFR_DATA_TRANSACTION, valid_on,
+                                          sources, sinks, witness, pending);
+        if (*pending & PFLAG_SBRAIN)
+            ret = -EIO;
+        if (ret)
+            goto out;
+    }
+    if (esh) {
+        ret = afr_selfheal_find_direction(frame, this, replies,
+                                          AFR_ENTRY_TRANSACTION, valid_on,
+                                          sources, sinks, witness, pending);
+        if (*pending & PFLAG_SBRAIN)
+            ret = -EIO;
+        if (ret)
+            goto out;
+    }
+
+    ret = afr_update_heal_status(this, replies, (*inode)->ia_type, &esh, &dsh,
+                                 &msh, *pending);
+out:
+    *data_selfheal = dsh;
+    *entry_selfheal = esh;
+    *metadata_selfheal = msh;
+    if (replies)
+        afr_replies_wipe(replies, priv->child_count);
+    return ret;
+}
+
 int
 afr_get_heal_info(call_frame_t *frame, xlator_t *this, loc_t *loc)
 {
@@ -6246,9 +6947,10 @@ afr_get_heal_info(call_frame_t *frame, xlator_t *this, loc_t *loc)
     }
     heal_local = heal_frame->local;
     heal_frame->local = frame->local;
-    ret = afr_selfheal_locked_inspect(heal_frame, this, loc->gfid, &inode,
-                                      &entry_selfheal, &data_selfheal,
-                                      &metadata_selfheal, &pending);
+
+    ret = afr_lockless_inspect(heal_frame, this, loc->gfid, &inode,
+                               &entry_selfheal, &data_selfheal,
+                               &metadata_selfheal, &pending);
 
     if (ret == -ENOMEM) {
         ret = -1;
@@ -6721,7 +7423,7 @@ afr_fav_child_reset_sink_xattrs(void *opaque)
         ret = afr_selfheal_inodelk(heal_frame, this, inode, this->name, 0, 0,
                                    locked_on);
         {
-            if (ret < AFR_SH_MIN_PARTICIPANTS)
+            if (ret < priv->child_count)
                 goto data_unlock;
             ret = __afr_selfheal_data_prepare(
                 heal_frame, this, inode, locked_on, sources, sinks,
@@ -6738,7 +7440,7 @@ afr_fav_child_reset_sink_xattrs(void *opaque)
         ret = afr_selfheal_inodelk(heal_frame, this, inode, this->name,
                                    LLONG_MAX - 1, 0, locked_on);
         {
-            if (ret < AFR_SH_MIN_PARTICIPANTS)
+            if (ret < priv->child_count)
                 goto mdata_unlock;
             ret = __afr_selfheal_metadata_prepare(
                 heal_frame, this, inode, locked_on, sources, sinks,
@@ -7070,15 +7772,15 @@ afr_ta_has_quorum(afr_private_t *priv, afr_local_t *local)
     return _gf_false;
 }
 
-gf_boolean_t
+static gf_boolean_t
 afr_is_add_replica_mount_lookup_on_root(call_frame_t *frame)
 {
     afr_local_t *local = NULL;
 
-    local = frame->local;
-
     if (frame->root->pid != GF_CLIENT_PID_ADD_REPLICA_MOUNT)
         return _gf_false;
+
+    local = frame->local;
 
     if (local->op != GF_FOP_LOOKUP)
         /* TODO:If the replica count is being increased on a plain distribute
@@ -7096,15 +7798,11 @@ afr_is_add_replica_mount_lookup_on_root(call_frame_t *frame)
 }
 
 gf_boolean_t
-afr_lookup_has_quorum(call_frame_t *frame, xlator_t *this,
-                      unsigned char *subvols)
+afr_lookup_has_quorum(call_frame_t *frame, const unsigned int up_children_count)
 {
-    afr_private_t *priv = this->private;
-
-    if (frame && afr_is_add_replica_mount_lookup_on_root(frame)) {
-        if (AFR_COUNT(subvols, priv->child_count) > 0)
-            return _gf_true;
-    }
+    if (frame && (up_children_count > 0) &&
+        afr_is_add_replica_mount_lookup_on_root(frame))
+        return _gf_true;
 
     return _gf_false;
 }

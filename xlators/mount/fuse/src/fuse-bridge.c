@@ -205,7 +205,7 @@ fusedump_setup_meta(struct iovec *iovs, char *dir,
 
 static int
 check_and_dump_fuse_W(fuse_private_t *priv, struct iovec *iov_out, int count,
-                      ssize_t res)
+                      ssize_t res, errnomask_t errnomask)
 {
     char w = 'W';
     struct iovec diov[4] = {
@@ -223,8 +223,59 @@ check_and_dump_fuse_W(fuse_private_t *priv, struct iovec *iov_out, int count,
     struct fuse_out_header *fouh = NULL;
 
     if (res == -1) {
-        gf_log_callingfn("glusterfs-fuse", GF_LOG_ERROR,
-                         "writing to fuse device failed: %s", strerror(errno));
+        const char *errdesc = NULL;
+        gf_loglevel_t loglevel = GF_LOG_ERROR;
+
+        /* If caller masked the errno, then it
+         * does not indicate an error at the application
+         * level, so we degrade the log severity to DEBUG.
+         */
+        if (errnomask && errno < ERRNOMASK_MAX &&
+            GET_ERRNO_MASK(errnomask, errno))
+            loglevel = GF_LOG_DEBUG;
+
+        switch (errno) {
+            /* The listed errnos are FUSE status indicators,
+             * not legit values according to POSIX (see write(3p)),
+             * so resolving them according to the standard
+             * POSIX interpretation would be misleading.
+             */
+            case ENOENT:
+                errdesc = "ENOENT";
+                break;
+            case ENOTDIR:
+                errdesc = "ENOTDIR";
+                break;
+            case ENODEV:
+                errdesc = "ENODEV";
+                break;
+            case EPERM:
+                errdesc = "EPERM";
+                break;
+            case ENOMEM:
+                errdesc = "ENOMEM";
+                break;
+            case ENOTCONN:
+                errdesc = "ENOTCONN";
+                break;
+            case ECONNREFUSED:
+                errdesc = "ECONNREFUSED";
+                break;
+            case EOVERFLOW:
+                errdesc = "EOVERFLOW";
+                break;
+            case EBUSY:
+                errdesc = "EBUSY";
+                break;
+            case ENOTEMPTY:
+                errdesc = "ENOTEMPTY";
+                break;
+            default:
+                errdesc = strerror(errno);
+        }
+
+        gf_log_callingfn("glusterfs-fuse", loglevel,
+                         "writing to fuse device failed: %s", errdesc);
         return errno;
     }
 
@@ -289,7 +340,7 @@ send_fuse_iov(xlator_t *this, fuse_in_header_t *finh, struct iovec *iov_out,
     gf_log("glusterfs-fuse", GF_LOG_TRACE, "writev() result %d/%d %s", res,
            fouh->len, res == -1 ? strerror(errno) : "");
 
-    return check_and_dump_fuse_W(priv, iov_out, count, res);
+    return check_and_dump_fuse_W(priv, iov_out, count, res, NULL);
 }
 
 static int
@@ -359,6 +410,15 @@ fuse_invalidate_entry(xlator_t *this, uint64_t fuse_ino)
 
         fouh->unique = 0;
         fouh->error = FUSE_NOTIFY_INVAL_ENTRY;
+
+        if (ENOENT < ERRNOMASK_MAX)
+            MASK_ERRNO(node->errnomask, ENOENT);
+        if (ENOTDIR < ERRNOMASK_MAX)
+            MASK_ERRNO(node->errnomask, ENOTDIR);
+        if (EBUSY < ERRNOMASK_MAX)
+            MASK_ERRNO(node->errnomask, EBUSY);
+        if (ENOTEMPTY < ERRNOMASK_MAX)
+            MASK_ERRNO(node->errnomask, ENOTEMPTY);
 
         if (dentry->name) {
             nlen = strlen(dentry->name);
@@ -444,6 +504,9 @@ fuse_invalidate_inode(xlator_t *this, uint64_t fuse_ino)
     fniio->off = 0;
     fniio->len = -1;
 
+    if (ENOENT < ERRNOMASK_MAX)
+        MASK_ERRNO(node->errnomask, ENOENT);
+
     fuse_log_eh(this, "Invalidated inode %" PRIu64 " (gfid: %s)", fuse_ino,
                 uuid_utoa(inode->gfid));
     gf_log("glusterfs-fuse", GF_LOG_TRACE,
@@ -489,6 +552,7 @@ fuse_timed_message_new(void)
     /* should be NULL if not set */
     dmsg->fuse_message_body = NULL;
     INIT_LIST_HEAD(&dmsg->next);
+    memset(dmsg->errnomask, 0, sizeof(dmsg->errnomask));
 
     return dmsg;
 }
@@ -687,6 +751,8 @@ fuse_interrupt(xlator_t *this, fuse_in_header_t *finh, void *msg,
         dmsg->fuse_out_header.unique = finh->unique;
         dmsg->fuse_out_header.len = sizeof(dmsg->fuse_out_header);
         dmsg->fuse_out_header.error = -EAGAIN;
+        if (ENOENT < ERRNOMASK_MAX)
+            MASK_ERRNO(dmsg->errnomask, ENOENT);
         timespec_now(&dmsg->scheduled_ts);
         timespec_adjust_delta(&dmsg->scheduled_ts,
                               (struct timespec){0, 10000000});
@@ -1647,6 +1713,14 @@ fattr_to_gf_set_attr(int32_t valid)
         gf_valid |= GF_SET_ATTR_CTIME;
 #endif
 
+#if FUSE_KERNEL_MINOR_VERSION >= 9
+    if (valid & FATTR_ATIME_NOW)
+        gf_valid |= GF_ATTR_ATIME_NOW;
+
+    if (valid & FATTR_MTIME_NOW)
+        gf_valid |= GF_ATTR_MTIME_NOW;
+#endif
+
     if (valid & FATTR_SIZE)
         gf_valid |= GF_SET_ATTR_SIZE;
 
@@ -2346,21 +2420,26 @@ fuse_rename_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
 {
     fuse_state_t *state = NULL;
     fuse_in_header_t *finh = NULL;
+    char loc_uuid_str[64] = {0}, loc2_uuid_str[64] = {0};
 
     state = frame->root->state;
     finh = state->finh;
 
-    fuse_log_eh(this,
-                "op_ret: %d, op_errno: %d, %" PRIu64
-                ": %s() "
-                "path: %s parent: %s ==> path: %s parent: %s"
-                "gfid: %s",
-                op_ret, op_errno, frame->root->unique,
-                gf_fop_list[frame->root->op], state->loc.path,
-                state->loc.parent ? uuid_utoa(state->loc.parent->gfid) : "",
-                state->loc2.path,
-                state->loc2.parent ? uuid_utoa(state->loc2.parent->gfid) : "",
-                state->loc.inode ? uuid_utoa(state->loc.inode->gfid) : "");
+    fuse_log_eh(
+        this,
+        "op_ret: %d, op_errno: %d, %" PRIu64
+        ": %s() "
+        "path: %s parent: %s ==> path: %s parent: %s"
+        "gfid: %s",
+        op_ret, op_errno, frame->root->unique, gf_fop_list[frame->root->op],
+        state->loc.path,
+        (state->loc.parent ? uuid_utoa_r(state->loc.parent->gfid, loc_uuid_str)
+                           : ""),
+        state->loc2.path,
+        (state->loc2.parent
+             ? uuid_utoa_r(state->loc2.parent->gfid, loc2_uuid_str)
+             : ""),
+        state->loc.inode ? uuid_utoa(state->loc.inode->gfid) : "");
 
     /* need to check for loc->parent to keep clang-scan happy.
        It gets dereferenced below, and is checked for NULL above. */
@@ -3093,15 +3172,18 @@ fuse_copy_file_range_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
 void
 fuse_copy_file_range_resume(fuse_state_t *state)
 {
+    char fd_uuid_str[64] = {0}, fd_dst_uuid_str[64] = {0};
+
     gf_log("glusterfs-fuse", GF_LOG_TRACE,
            "%" PRIu64
            ": COPY_FILE_RANGE "
            "(input fd: %p (gfid: %s), "
            "output fd: %p (gfid: %s) size=%zu, "
            "offset_in=%" PRIu64 ", offset_out=%" PRIu64 ")",
-           state->finh->unique, state->fd, uuid_utoa(state->fd->inode->gfid),
-           state->fd_dst, uuid_utoa(state->fd_dst->inode->gfid), state->size,
-           state->off_in, state->off_out);
+           state->finh->unique, state->fd,
+           uuid_utoa_r(state->fd->inode->gfid, fd_uuid_str), state->fd_dst,
+           uuid_utoa_r(state->fd_dst->inode->gfid, fd_dst_uuid_str),
+           state->size, state->off_in, state->off_out);
 
     FUSE_FOP(state, fuse_copy_file_range_cbk, GF_FOP_COPY_FILE_RANGE,
              copy_file_range, state->fd, state->off_in, state->fd_dst,
@@ -4869,7 +4951,7 @@ notify_kernel_loop(void *data)
         iov_out.iov_base = node->inval_buf;
         iov_out.iov_len = len;
         rv = sys_writev(priv->fd, &iov_out, 1);
-        check_and_dump_fuse_W(priv, &iov_out, 1, rv);
+        check_and_dump_fuse_W(priv, &iov_out, 1, rv, node->errnomask);
 
         GF_FREE(node);
 
@@ -4961,7 +5043,7 @@ timed_response_loop(void *data)
         iovs[1] = (struct iovec){dmsg->fuse_message_body,
                                  len - sizeof(struct fuse_out_header)};
         rv = sys_writev(priv->fd, iovs, 2);
-        check_and_dump_fuse_W(priv, iovs, 2, rv);
+        check_and_dump_fuse_W(priv, iovs, 2, rv, dmsg->errnomask);
 
         fuse_timed_message_free(dmsg);
 
@@ -5220,7 +5302,7 @@ fuse_first_lookup(xlator_t *this)
     };
     xlator_t *xl = NULL;
     dict_t *dict = NULL;
-    uuid_t gfid;
+    static uuid_t gfid = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
     int ret = -1;
     struct iatt iatt = {
         0,
@@ -5238,8 +5320,6 @@ fuse_first_lookup(xlator_t *this)
 
     xl = priv->active_subvol;
 
-    memset(gfid, 0, 16);
-    gfid[15] = 1;
     ret = dict_set_gfuuid(dict, "gfid-req", gfid, true);
     if (ret) {
         gf_log(xl->name, GF_LOG_ERROR, "failed to set 'gfid-req'");
@@ -6652,12 +6732,18 @@ init(xlator_t *this_xl)
     ret = dict_get_str(options, "dump-fuse", &value_string);
     if (ret == 0) {
         ret = sys_unlink(value_string);
-        if (ret != -1 || errno == ENOENT)
-            ret = open(value_string, O_RDWR | O_CREAT | O_EXCL,
-                       S_IRUSR | S_IWUSR);
+        if (ret == -1 && errno != ENOENT) {
+            gf_log("glusterfs-fuse", GF_LOG_ERROR,
+                   "failed to remove old fuse dump file %s: %s", value_string,
+                   strerror(errno));
+
+            goto cleanup_exit;
+        }
+        ret = open(value_string, O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
         if (ret == -1) {
             gf_log("glusterfs-fuse", GF_LOG_ERROR,
-                   "cannot open fuse dump file %s", value_string);
+                   "failed to open fuse dump file %s: %s", value_string,
+                   strerror(errno));
 
             goto cleanup_exit;
         }

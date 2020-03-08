@@ -920,14 +920,11 @@ mnt3svc_volume_mount(rpcsvc_request_t *req, struct mount3_state *ms,
 {
     inode_t *exportinode = NULL;
     int ret = -EFAULT;
-    uuid_t rootgfid = {
-        0,
-    };
+    static uuid_t rootgfid = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
 
     if ((!req) || (!exp) || (!ms))
         return ret;
 
-    rootgfid[15] = 1;
     exportinode = inode_find(exp->vol->itable, rootgfid);
     if (!exportinode) {
         gf_msg(GF_MNT, GF_LOG_ERROR, ENOENT, NFS_MSG_GET_ROOT_INODE_FAIL,
@@ -1372,9 +1369,7 @@ __mnt3_resolve_subdir(mnt3_resolve_t *mres)
     nfs_user_t nfu = {
         0,
     };
-    uuid_t rootgfid = {
-        0,
-    };
+    static uuid_t rootgfid = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
 
     if (!mres)
         return ret;
@@ -1385,7 +1380,6 @@ __mnt3_resolve_subdir(mnt3_resolve_t *mres)
     if (!firstcomp)
         goto err;
 
-    rootgfid[15] = 1;
     ret = nfs_entry_loc_fill(mres->mstate->nfsx, mres->exp->vol->itable,
                              rootgfid, firstcomp, &mres->resolveloc,
                              NFS_RESOLVE_CREATE, NULL);
@@ -3662,20 +3656,26 @@ out:
     return ret;
 }
 
-rpcsvc_actor_t mnt3svc_actors[MOUNT3_PROC_COUNT] = {
-    {"NULL", MOUNT3_NULL, mnt3svc_null, NULL, 0, DRC_NA},
-    {"MNT", MOUNT3_MNT, mnt3svc_mnt, NULL, 0, DRC_NA},
-    {"DUMP", MOUNT3_DUMP, mnt3svc_dump, NULL, 0, DRC_NA},
-    {"UMNT", MOUNT3_UMNT, mnt3svc_umnt, NULL, 0, DRC_NA},
-    {"UMNTALL", MOUNT3_UMNTALL, mnt3svc_umntall, NULL, 0, DRC_NA},
-    {"EXPORT", MOUNT3_EXPORT, mnt3svc_export, NULL, 0, DRC_NA}};
+static rpcsvc_actor_t mnt3svc_actors[MOUNT3_PROC_COUNT] = {
+    {
+        "NULL",
+        mnt3svc_null,
+        NULL,
+        MOUNT3_NULL,
+        DRC_NA,
+    },
+    {"MNT", mnt3svc_mnt, NULL, MOUNT3_MNT, DRC_NA, 0},
+    {"DUMP", mnt3svc_dump, NULL, MOUNT3_DUMP, DRC_NA, 0},
+    {"UMNT", mnt3svc_umnt, NULL, MOUNT3_UMNT, DRC_NA, 0},
+    {"UMNTALL", mnt3svc_umntall, NULL, MOUNT3_UMNTALL, DRC_NA, 0},
+    {"EXPORT", mnt3svc_export, NULL, MOUNT3_EXPORT, DRC_NA, 0}};
 
 /* Static init parts are assigned here, dynamic ones are done in
  * mnt3svc_init and mnt3_init_state.
  * Making MOUNT3 a synctask so that the blocking DNS calls during rpc auth
  * gets offloaded to syncenv, keeping the main/poll thread unblocked
  */
-rpcsvc_program_t mnt3prog = {
+static rpcsvc_program_t mnt3prog = {
     .progname = "MOUNT3",
     .prognum = MOUNT_PROGRAM,
     .progver = MOUNT_V3,
@@ -4118,15 +4118,15 @@ err:
     return NULL;
 }
 
-rpcsvc_actor_t mnt1svc_actors[MOUNT1_PROC_COUNT] = {
-    {"NULL", MOUNT1_NULL, mnt3svc_null, NULL, 0, DRC_NA},
-    {"MNT", MOUNT1_MNT, NULL, NULL, 0, DRC_NA},
-    {"DUMP", MOUNT1_DUMP, mnt3svc_dump, NULL, 0, DRC_NA},
-    {"UMNT", MOUNT1_UMNT, mnt3svc_umnt, NULL, 0, DRC_NA},
-    {"UMNTALL", MOUNT1_UMNTALL, NULL, NULL, 0, DRC_NA},
-    {"EXPORT", MOUNT1_EXPORT, mnt3svc_export, NULL, 0, DRC_NA}};
+static rpcsvc_actor_t mnt1svc_actors[MOUNT1_PROC_COUNT] = {
+    {"NULL", mnt3svc_null, NULL, MOUNT1_NULL, DRC_NA, 0},
+    {"MNT", NULL, NULL, MOUNT1_MNT, DRC_NA, 0},
+    {"DUMP", mnt3svc_dump, NULL, MOUNT1_DUMP, DRC_NA, 0},
+    {"UMNT", mnt3svc_umnt, NULL, MOUNT1_UMNT, DRC_NA, 0},
+    {"UMNTALL", NULL, NULL, MOUNT1_UMNTALL, DRC_NA, 0},
+    {"EXPORT", mnt3svc_export, NULL, MOUNT1_EXPORT, DRC_NA, 0}};
 
-rpcsvc_program_t mnt1prog = {
+static rpcsvc_program_t mnt1prog = {
     .progname = "MOUNT1",
     .prognum = MOUNT_PROGRAM,
     .progver = MOUNT_V1,

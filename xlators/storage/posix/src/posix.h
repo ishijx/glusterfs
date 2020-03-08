@@ -16,12 +16,8 @@
 #include <dirent.h>
 #include <time.h>
 
-#ifdef linux
-#ifdef __GLIBC__
+#ifdef HAVE_SET_FSID
 #include <sys/fsuid.h>
-#else
-#include <unistd.h>
-#endif
 #endif
 
 #ifdef HAVE_SYS_XATTR_H
@@ -51,21 +47,21 @@
 #define ACL_BUFFER_MAX 4096 /* size of character buffer */
 
 #define DHT_LINKTO "trusted.glusterfs.dht.linkto"
-/*
- * TIER_MODE need to be changed when we stack tiers
- */
-#define TIER_LINKTO "trusted.tier.tier-dht.linkto"
 
 #define POSIX_GFID_HANDLE_SIZE(base_path_len)                                  \
     (base_path_len + SLEN("/") + SLEN(GF_HIDDEN_PATH) + SLEN("/") +            \
      SLEN("00/") + SLEN("00/") + SLEN(UUID0_STR) + 1) /* '\0' */;
+
+#define POSIX_GFID_HANDLE_RELSIZE                                              \
+    SLEN("../") + SLEN("../") + SLEN("00/") + SLEN("00/") + SLEN(UUID0_STR) + 1;
+
 #define GF_UNLINK_TRUE 0x0000000000000001
 #define GF_UNLINK_FALSE 0x0000000000000000
 
 #define DISK_SPACE_CHECK_AND_GOTO(frame, priv, xdata, op_ret, op_errno, out)   \
     do {                                                                       \
         if (frame->root->pid >= 0 && priv->disk_space_full &&                  \
-            !dict_get(xdata, GLUSTERFS_INTERNAL_FOP_KEY)) {                    \
+            !dict_get_sizen(xdata, GLUSTERFS_INTERNAL_FOP_KEY)) {              \
             op_ret = -1;                                                       \
             op_errno = ENOSPC;                                                 \
             gf_msg_debug("posix", ENOSPC,                                      \
@@ -93,9 +89,8 @@
 #endif
 
 #define GFID_NULL_CHECK_AND_GOTO(frame, this, loc, xattr_req, op_ret,          \
-                                 op_errno, out)                                \
+                                 op_errno, _uuid_req, out)                     \
     do {                                                                       \
-        uuid_t _uuid_req;                                                      \
         int _ret = 0;                                                          \
         /* TODO: Remove pid check once trash implements client side            \
          * logic to assign gfid for entry creations inside .trashcan           \
@@ -105,9 +100,7 @@
         _ret = dict_get_gfuuid(xattr_req, "gfid-req", &_uuid_req);             \
         if (_ret) {                                                            \
             gf_msg(this->name, GF_LOG_ERROR, EINVAL, P_MSG_NULL_GFID,          \
-                   "failed to get the gfid from"                               \
-                   " dict for %s",                                             \
-                   loc->path);                                                 \
+                   "failed to get the gfid from dict for %s", loc->path);      \
             op_ret = -1;                                                       \
             op_errno = EINVAL;                                                 \
             goto out;                                                          \
@@ -384,9 +377,6 @@ posix_resolve_dirgfid_to_path(const uuid_t dirgfid, const char *brick_path,
                               const char *bname, char **path);
 void
 posix_gfid_unset(xlator_t *this, dict_t *xdata);
-
-int
-posix_pacl_set(const char *path, int fdnum, const char *key, const char *acl_s);
 
 int
 posix_pacl_get(const char *path, int fdnum, const char *key, char **acl_s);
@@ -668,4 +658,8 @@ posix_spawn_ctx_janitor_thread(xlator_t *this);
 
 void
 posix_update_iatt_buf(struct iatt *buf, int fd, char *loc, dict_t *xdata);
+
+gf_boolean_t
+posix_is_layout_stale(dict_t *xdata, char *par_path, xlator_t *this);
+
 #endif /* _POSIX_H */

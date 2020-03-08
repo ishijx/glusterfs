@@ -14,7 +14,6 @@
 #include "glusterd-op-sm.h"
 #include "glusterd-store.h"
 #include "glusterd-utils.h"
-#include "glusterd-nfs-svc.h"
 #include "glusterd-quotad-svc.h"
 #include "glusterd-volgen.h"
 #include "glusterd-messages.h"
@@ -1809,10 +1808,12 @@ glusterd_op_quota(dict_t *dict, char **op_errstr, dict_t *rsp_dict)
         goto out;
     }
 
+#if BUILD_GNFS
     if (GLUSTERD_STATUS_STARTED == volinfo->status) {
         if (priv->op_version == GD_OP_VERSION_MIN)
             (void)priv->nfs_svc.manager(&(priv->nfs_svc), NULL, 0);
     }
+#endif
 
     if (rsp_dict && start_crawl == _gf_true)
         glusterd_quota_initiate_fs_crawl(priv, volinfo, type);

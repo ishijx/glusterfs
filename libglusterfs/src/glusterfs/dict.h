@@ -97,7 +97,6 @@ typedef struct _data_pair data_pair_t;
 struct _data {
     char *data;
     gf_atomic_t refcount;
-    gf_lock_t lock;
     gf_dict_data_type_t data_type;
     int32_t len;
     gf_boolean_t is_static;
@@ -119,12 +118,10 @@ struct _dict {
     gf_atomic_t refcount;
     data_pair_t **members;
     data_pair_t *members_list;
-    char *extra_free;
     char *extra_stdfree;
     gf_lock_t lock;
     data_pair_t *members_internal;
     data_pair_t free_pair;
-    gf_boolean_t free_pair_in_use;
 };
 
 typedef gf_boolean_t (*dict_match_t)(dict_t *d, char *k, data_t *v, void *data);

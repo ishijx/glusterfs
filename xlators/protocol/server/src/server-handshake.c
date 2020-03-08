@@ -231,6 +231,7 @@ server_setvolume(rpcsvc_request_t *req)
     dict_t *config_params = NULL;
     dict_t *params = NULL;
     char *name = NULL;
+    char *volume_id = NULL;
     char *client_uid = NULL;
     char *clnt_version = NULL;
     xlator_t *xl = NULL;
@@ -239,7 +240,6 @@ server_setvolume(rpcsvc_request_t *req)
     int32_t ret = -1;
     int32_t op_ret = -1;
     int32_t op_errno = EINVAL;
-    char *buf = NULL;
     uint32_t opversion = 0;
     rpc_transport_t *xprt = NULL;
     int32_t fop_version = 0;
@@ -249,6 +249,7 @@ server_setvolume(rpcsvc_request_t *req)
     char *subdir_mount = NULL;
     char *client_name = NULL;
     gf_boolean_t cleanup_starting = _gf_false;
+    gf_boolean_t xlator_in_graph = _gf_true;
 
     params = dict_new();
     reply = dict_new();
@@ -266,18 +267,11 @@ server_setvolume(rpcsvc_request_t *req)
      */
     config_params = dict_copy_with_ref(this->options, NULL);
 
-    buf = gf_memdup(args.dict.dict_val, args.dict.dict_len);
-    if (buf == NULL) {
-        op_ret = -1;
-        op_errno = ENOMEM;
-        goto fail;
-    }
-
-    ret = dict_unserialize(buf, args.dict.dict_len, &params);
+    ret = dict_unserialize(args.dict.dict_val, args.dict.dict_len, &params);
     if (ret < 0) {
-        ret = dict_set_str(reply, "ERROR",
-                           "Internal error: failed to unserialize "
-                           "request dictionary");
+        ret = dict_set_sizen_str_sizen(reply, "ERROR",
+                                       "Internal error: failed to unserialize "
+                                       "request dictionary");
         if (ret < 0)
             gf_msg_debug(this->name, 0,
                          "failed to set error "
@@ -289,9 +283,6 @@ server_setvolume(rpcsvc_request_t *req)
         op_errno = EINVAL;
         goto fail;
     }
-
-    params->extra_free = buf;
-    buf = NULL;
 
     ret = dict_get_str(params, "remote-subvolume", &name);
     if (ret < 0) {
@@ -310,8 +301,10 @@ server_setvolume(rpcsvc_request_t *req)
     LOCK(&ctx->volfile_lock);
     {
         xl = get_xlator_by_name(this, name);
-        if (!xl)
+        if (!xl) {
+            xlator_in_graph = _gf_false;
             xl = this;
+        }
     }
     UNLOCK(&ctx->volfile_lock);
     if (xl == NULL) {
@@ -408,6 +401,25 @@ server_setvolume(rpcsvc_request_t *req)
         client_name = "unknown";
     }
 
+    /* If any value is set, the first element will be non-0.
+       It would be '0', but not '\0' :-) */
+    if (xl->graph->volume_id[0]) {
+        ret = dict_get_str_sizen(params, "volume-id", &volume_id);
+        if (!ret && strcmp(xl->graph->volume_id, volume_id)) {
+            ret = dict_set_str(reply, "ERROR",
+                               "Volume-ID different, possible case "
+                               "of same brick re-used in another volume");
+            if (ret < 0)
+                gf_msg_debug(this->name, 0, "failed to set error msg");
+
+            op_ret = -1;
+            op_errno = EINVAL;
+            goto fail;
+        }
+        ret = dict_set_str(reply, "volume-id", tmp->volume_id);
+        if (ret)
+            gf_msg_debug(this->name, 0, "failed to set 'volume-id'");
+    }
     client = gf_client_get(this, &req->cred, client_uid, subdir_mount);
     if (client == NULL) {
         op_ret = -1;
@@ -567,20 +579,30 @@ server_setvolume(rpcsvc_request_t *req)
                          "failed to set error "
                          "msg");
     } else {
-        gf_event(EVENT_CLIENT_AUTH_REJECT,
-                 "client_uid=%s;"
-                 "client_identifier=%s;server_identifier=%s;"
-                 "brick_path=%s",
-                 client->client_uid, req->trans->peerinfo.identifier,
-                 req->trans->myinfo.identifier, name);
-        gf_msg(this->name, GF_LOG_ERROR, EACCES, PS_MSG_AUTHENTICATE_ERROR,
-               "Cannot authenticate client"
-               " from %s %s",
-               client->client_uid, (clnt_version) ? clnt_version : "old");
-
         op_ret = -1;
-        op_errno = EACCES;
-        ret = dict_set_str(reply, "ERROR", "Authentication failed");
+        if (!xlator_in_graph) {
+            gf_msg(this->name, GF_LOG_ERROR, ENOENT, PS_MSG_AUTHENTICATE_ERROR,
+                   "Cannot authenticate client"
+                   " from %s %s because brick is not attached in graph",
+                   client->client_uid, (clnt_version) ? clnt_version : "old");
+
+            op_errno = ENOENT;
+            ret = dict_set_str(reply, "ERROR", "Brick not found");
+        } else {
+            gf_event(EVENT_CLIENT_AUTH_REJECT,
+                     "client_uid=%s;"
+                     "client_identifier=%s;server_identifier=%s;"
+                     "brick_path=%s",
+                     client->client_uid, req->trans->peerinfo.identifier,
+                     req->trans->myinfo.identifier, name);
+            gf_msg(this->name, GF_LOG_ERROR, EACCES, PS_MSG_AUTHENTICATE_ERROR,
+                   "Cannot authenticate client"
+                   " from %s %s",
+                   client->client_uid, (clnt_version) ? clnt_version : "old");
+
+            op_errno = EACCES;
+            ret = dict_set_str(reply, "ERROR", "Authentication failed");
+        }
         if (ret < 0)
             gf_msg_debug(this->name, 0,
                          "failed to set error "
@@ -707,8 +729,6 @@ fail:
         dict_unref(config_params);
     }
 
-    GF_FREE(buf);
-
     return 0;
 }
 
@@ -756,15 +776,15 @@ fail:
     return 0;
 }
 
-rpcsvc_actor_t gluster_handshake_actors[GF_HNDSK_MAXVALUE] = {
-    [GF_HNDSK_NULL] = {"NULL", GF_HNDSK_NULL, server_null, NULL, 0, DRC_NA},
-    [GF_HNDSK_SETVOLUME] = {"SETVOLUME", GF_HNDSK_SETVOLUME, server_setvolume,
-                            NULL, 0, DRC_NA},
-    [GF_HNDSK_GETSPEC] = {"GETSPEC", GF_HNDSK_GETSPEC, server_getspec, NULL, 0,
-                          DRC_NA},
-    [GF_HNDSK_PING] = {"PING", GF_HNDSK_PING, server_ping, NULL, 0, DRC_NA},
-    [GF_HNDSK_SET_LK_VER] = {"SET_LK_VER", GF_HNDSK_SET_LK_VER,
-                             server_set_lk_version, NULL, 0, DRC_NA},
+static rpcsvc_actor_t gluster_handshake_actors[GF_HNDSK_MAXVALUE] = {
+    [GF_HNDSK_NULL] = {"NULL", server_null, NULL, GF_HNDSK_NULL, DRC_NA, 0},
+    [GF_HNDSK_SETVOLUME] = {"SETVOLUME", server_setvolume, NULL,
+                            GF_HNDSK_SETVOLUME, DRC_NA, 0},
+    [GF_HNDSK_GETSPEC] = {"GETSPEC", server_getspec, NULL, GF_HNDSK_GETSPEC,
+                          DRC_NA, 0},
+    [GF_HNDSK_PING] = {"PING", server_ping, NULL, GF_HNDSK_PING, DRC_NA, 0},
+    [GF_HNDSK_SET_LK_VER] = {"SET_LK_VER", server_set_lk_version, NULL,
+                             GF_HNDSK_SET_LK_VER, DRC_NA, 0},
 };
 
 struct rpcsvc_program gluster_handshake_prog = {

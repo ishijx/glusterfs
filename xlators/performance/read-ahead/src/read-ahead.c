@@ -513,9 +513,9 @@ ra_readv(call_frame_t *frame, xlator_t *this, fd_t *fd, size_t size,
 
     read_ahead(frame, file);
 
-    ra_frame_return(frame);
-
     file->offset = offset + size;
+
+    ra_frame_return(frame);
 
     return 0;
 
@@ -1021,7 +1021,6 @@ ra_priv_dump(xlator_t *this)
     char key_prefix[GF_DUMP_MAX_BUF_LEN] = {
         0,
     };
-    gf_boolean_t add_section = _gf_false;
 
     if (!this) {
         goto out;
@@ -1037,7 +1036,6 @@ ra_priv_dump(xlator_t *this)
     gf_proc_dump_build_key(key_prefix, "xlator.performance.read-ahead", "priv");
 
     gf_proc_dump_add_section("%s", key_prefix);
-    add_section = _gf_true;
 
     ret = pthread_mutex_trylock(&conf->conf_lock);
     if (ret)
@@ -1053,9 +1051,6 @@ ra_priv_dump(xlator_t *this)
     ret = 0;
 out:
     if (ret && conf) {
-        if (add_section == _gf_false)
-            gf_proc_dump_add_section("%s", key_prefix);
-
         gf_proc_dump_write("Unable to dump priv",
                            "(Lock acquisition failed) %s", this->name);
     }

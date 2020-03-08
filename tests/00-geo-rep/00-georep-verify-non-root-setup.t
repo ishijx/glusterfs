@@ -118,8 +118,8 @@ clean_lock_files
 TEST /usr/sbin/groupadd $grp
 
 clean_lock_files
-##Create non-root user and assign it to newly created group
-
+##Del if exists and create non-root user and assign it to newly created group
+userdel -r -f $usr
 TEST /usr/sbin/useradd -G $grp $usr
 
 ##Modify password for non-root user to have control over distributing ssh-key
@@ -139,8 +139,6 @@ sed '/^PasswordAuthentication /{s/no/yes/}' -i /etc/ssh/sshd_config && grep '^Pa
 TEST killall_gluster;
 TEST glusterd;
 TEST pidof glusterd;
-
-
 
 ##Create, start and mount meta_volume
 TEST $CLI volume create $META_VOL replica 3 $H0:$B0/${META_VOL}{1,2,3};
@@ -175,11 +173,11 @@ EOL
 chmod u+x ${SSH_ASKPASS_SCRIPT}
 
 ##set no display, necessary for ssh to use with setsid and SSH_ASKPASS
-#export DISPLAY=:0
+export DISPLAY
 
 export SSH_ASKPASS=${SSH_ASKPASS_SCRIPT}
 
-DISPLAY=: setsid ssh-copy-id -i ~/.ssh/id_rsa.pub $ssh_url
+DISPLAY=: setsid ssh-copy-id -o 'PreferredAuthentications=password' -o 'StrictHostKeyChecking=no' -i ~/.ssh/id_rsa.pub $ssh_url
 
 ##Setting up PATH for gluster binaries in case of source installation
 ##ssh -oNumberOfPasswordPrompts=0 -oStrictHostKeyChecking=no $ssh_url "echo "export PATH=$PATH:/usr/local/sbin" >> ~/.bashrc"
@@ -225,6 +223,42 @@ TEST $GEOREP_CLI  $master $slave_url resume
 #Validate failure of volume stop when geo-rep is running
 TEST ! $CLI volume stop $GMV0
 
+#Negative test for ssh-port
+#Port should be integer and between 1-65535 range
+
+TEST ! $GEOREP_CLI $master $slave_url config ssh-port -22
+
+TEST ! $GEOREP_CLI $master $slave_url config ssh-port abc
+
+TEST ! $GEOREP_CLI $master $slave_url config ssh-port 6875943
+
+TEST ! $GEOREP_CLI $master $slave_url config ssh-port 4.5
+
+TEST ! $GEOREP_CLI $master $slave_url config ssh-port 22a
+
+#Config Set ssh-port to validate int validation
+TEST $GEOREP_CLI $master $slave config ssh-port 22
+
+#Hybrid directory rename test BZ#1763439
+TEST $GEOREP_CLI $master $slave_url config change_detector xsync
+mkdir ${master_mnt}/dir1
+mkdir ${master_mnt}/dir1/dir2
+mkdir ${master_mnt}/dir1/dir3
+mkdir ${master_mnt}/hybrid_d1
+
+EXPECT_WITHIN $GEO_REP_TIMEOUT 0 directory_ok ${slave_mnt}/hybrid_d1
+EXPECT_WITHIN $GEO_REP_TIMEOUT 0 directory_ok ${slave_mnt}/dir1
+EXPECT_WITHIN $GEO_REP_TIMEOUT 0 directory_ok ${slave_mnt}/dir1/dir2
+EXPECT_WITHIN $GEO_REP_TIMEOUT 0 directory_ok ${slave_mnt}/dir1/dir3
+
+mv ${master_mnt}/hybrid_d1 ${master_mnt}/hybrid_rn_d1
+mv ${master_mnt}/dir1/dir2 ${master_mnt}/rn_dir2
+mv ${master_mnt}/dir1/dir3 ${master_mnt}/dir1/rn_dir3
+
+EXPECT_WITHIN $GEO_REP_TIMEOUT 0 directory_ok ${slave_mnt}/hybrid_rn_d1
+EXPECT_WITHIN $GEO_REP_TIMEOUT 0 directory_ok ${slave_mnt}/rn_dir2
+EXPECT_WITHIN $GEO_REP_TIMEOUT 0 directory_ok ${slave_mnt}/dir1/rn_dir3
+
 #Stop Geo-rep
 TEST $GEOREP_CLI $master $slave_url stop
 
@@ -232,8 +266,8 @@ TEST $GEOREP_CLI $master $slave_url stop
 TEST $GEOREP_CLI $master $slave_url delete
 
 #Cleanup authorized_keys
-sed -i '/^command=.*SSH_ORIGINAL_COMMAND#.*/d' ~/.ssh/authorized_keys
-sed -i '/^command=.*gsyncd.*/d' ~/.ssh/authorized_keys
+sed -i '/^command=.*SSH_ORIGINAL_COMMAND#.*/d' /home/$usr/.ssh/authorized_keys
+sed -i '/^command=.*gsyncd.*/d' /home/$usr/.ssh/authorized_keys
 
 #clear mountbroker
 gluster-mountbroker remove --user $usr

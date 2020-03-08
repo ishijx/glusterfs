@@ -41,7 +41,7 @@ List all volumes in cluster
 \fB\ volume status [all | <VOLNAME> [nfs|shd|<BRICK>|quotad]] [detail|clients|mem|inode|fd|callpool|tasks|client-list] \fR
 Display status of all or specified volume(s)/brick
 .TP
-\fB\ volume create <NEW-VOLNAME> [stripe <COUNT>] [[replica <COUNT> [arbiter <COUNT>]]|[replica 2 thin-arbiter 1]] [disperse [<COUNT>]] [redundancy <COUNT>] [transport <tcp|rdma|tcp,rdma>] <NEW-BRICK> ... <TA-BRICK> \fR
+\fB\ volume create <NEW-VOLNAME> [stripe <COUNT>] [[replica <COUNT> [arbiter <COUNT>]]|[replica 2 thin-arbiter 1]] [disperse [<COUNT>]] [disperse-data <COUNT>] [redundancy <COUNT>] [transport <tcp|rdma|tcp,rdma>] <NEW-BRICK> ... <TA-BRICK> \fR
 Create a new volume of the specified type using the specified bricks and transport type (the default transport type is tcp).
 To create a volume with both transports (tcp and rdma), give 'transport tcp,rdma' as an option.
 .TP
@@ -112,6 +112,9 @@ Rotate the log file for corresponding volume/brick.
 .TP
 \fB\ volume profile <VOLNAME> {start|info [peek|incremental [peek]|cumulative|clear]|stop} [nfs] \fR
 Profile operations on the volume. Once started, volume profile <volname> info provides cumulative statistics of the FOPs performed.
+.TP
+\fB\ volume top <VOLNAME> {open|read|write|opendir|readdir|clear} [nfs|brick <brick>] [list-cnt <value>] | {read-perf|write-perf} [bs <size> count <count>] [brick <brick>] [list-cnt <value>] \fR
+Generates a profile of a volume representing the performance and bottlenecks/hotspots of each brick.
 .TP
 \fB\ volume statedump <VOLNAME> [[nfs|quotad] [all|mem|iobuf|callpool|priv|fd|inode|history]... | [client <hostname:process-id>]] \fR
 Dumps the in memory state of the specified process or the bricks of the volume.
@@ -214,6 +217,12 @@ Use "!<OPTION>" to reset option <OPTION> to default value.
 .TP
 \fB\ volume bitrot <VOLNAME> {enable|disable} \fR
 Enable/disable bitrot for volume <VOLNAME>
+.TP
+\fB\ volume bitrot <VOLNAME> signing-time <time-in-secs> \fR
+Waiting time for an object after last fd is closed to start signing process.
+.TP
+\fB\ volume bitrot <VOLNAME> signer-threads <count> \fR
+Number of signing process threads. Usually set to number of available cores.
 .TP
 \fB\ volume bitrot <VOLNAME> scrub-throttle {lazy|normal|aggressive} \fR
 Scrub-throttle value is a measure of how fast or slow the scrubber scrubs the filesystem for volume <VOLNAME>
